@@ -129,7 +129,7 @@ def prepare(limit: Optional[int], val_ratio: float):
     print(f"[prepare] Downloading {DATASET_ID} to local cache (num_proc={num_proc}) …", flush=True)
     # Non-streaming: downloads all parquet files to HF cache first,
     # then processes locally — orders of magnitude faster than streaming.
-    ds = load_dataset(DATASET_ID, split="train", num_proc=num_proc)
+    ds = load_dataset(DATASET_ID, split="train", num_proc=num_proc, verification_mode="no_checks")
 
     if limit:
         ds = ds.select(range(limit))
