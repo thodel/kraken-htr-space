@@ -181,10 +181,9 @@ def train(
     epochs: int,
     batch_size: int,
     lr: float,
-    workers: int,
-    device: str,
     resume: Optional[str],
 ):
+    """Invoke ketos train with correct kraken 7.x flags."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     train_manifest = GT_DIR / "train.txt"
@@ -192,24 +191,33 @@ def train(
     if not train_manifest.exists():
         sys.exit("[train] ERROR: ground truth not found — run prepare first")
 
+    # kraken 7.x ketos train flags (verified against `ketos train --help`):
+    #   -s  VGSL spec
+    #   -f  format: 'path' = image + .gt.txt sidecar pairs
+    #   -t  manifest file listing training image paths
+    #   -e  manifest file listing evaluation image paths
+    #   -o  output directory for checkpoints
+    #   -N  number of epochs
+    #   -B  batch size
+    #   -r  learning rate
+    #   --device and --workers do NOT exist in kraken 7.x (Lightning auto-detects GPU)
     cmd = [
         "ketos", "train",
-        "--arch",             VGSL_SPEC,
-        "--ground-truth",     str(train_manifest),
-        "--evaluation-files", str(val_manifest),
-        "--output",           str(MODELS_DIR / "kraken_plus"),
-        "--epochs",           str(epochs),
-        "--batch-size",       str(batch_size),
-        "--lr",               str(lr),
-        "--workers",          str(workers),
-        "--device",           device,
-        "--optimizer",        "Adam",
-        "--schedule",         "reduceonplateau",
-        "--lag",              "5",
-        "--min-delta",        "0.005",
+        "-f", "path",
+        "-s", VGSL_SPEC,
+        "-t", str(train_manifest),
+        "-e", str(val_manifest),
+        "-o", str(MODELS_DIR / "kraken_plus"),
+        "-N", str(epochs),
+        "-B", str(batch_size),
+        "-r", str(lr),
+        "--optimizer",       "Adam",
+        "--schedule",        "reduceonplateau",
+        "--lag",             "5",
+        "--min-delta",       "0.005",
     ]
     if resume:
-        cmd += ["--load", resume]
+        cmd += ["--resume", resume]
 
     print("[train] " + " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
@@ -253,8 +261,6 @@ def main():
     tr.add_argument("--epochs",     type=int,   default=50)
     tr.add_argument("--batch-size", type=int,   default=32)
     tr.add_argument("--lr",         type=float, default=2e-4)
-    tr.add_argument("--workers",    type=int,   default=8)
-    tr.add_argument("--device",     type=str,   default="cuda:0")
     tr.add_argument("--resume",     type=str,   default=None)
 
     pu = sub.add_parser("push")
@@ -265,7 +271,7 @@ def main():
     if args.stage == "prepare":
         prepare(args.limit, args.val_ratio)
     elif args.stage == "train":
-        train(args.epochs, args.batch_size, args.lr, args.workers, args.device, args.resume)
+        train(args.epochs, args.batch_size, args.lr, args.resume)
     elif args.stage == "push":
         push_checkpoints(args.output_repo)
 

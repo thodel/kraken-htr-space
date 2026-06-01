@@ -81,8 +81,6 @@ def _train_cmd(epochs, batch_size, lr, resume_path):
         "--epochs",     str(int(epochs)),
         "--batch-size", str(int(batch_size)),
         "--lr",         str(lr),
-        "--workers",    "8",
-        "--device",     "cuda:0",
     ]
     if resume_path.strip():
         cmd += ["--resume", resume_path.strip()]
