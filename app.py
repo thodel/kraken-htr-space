@@ -3,8 +3,9 @@ Gradio 6.x front-end for kraken+ training on HF Spaces (A100 80 GB).
 
 Workflow:
   1. Set HF_TOKEN and OUTPUT_REPO as Space secrets.
-  2. Click "Prepare GT" — streams dataset, writes ~80 GB of PNG + .gt.txt files.
-  3. Click "Start Training" — runs ketos train; logs stream live.
+  2. Configure training params, tick "Auto-start training after prepare" if desired.
+  3. Click "Prepare GT" — downloads dataset, writes JPEG + .gt.txt ground truth.
+     If auto-start is enabled, training begins automatically when prepare finishes.
   4. Click "Push Checkpoints" — uploads .mlmodel files to your output repo.
 """
 
@@ -41,6 +42,17 @@ def _run(cmd: list[str], label: str):
     _stage = "idle"
 
 
+def _run_pipeline(cmds: list[tuple[list[str], str]]):
+    """Run multiple (cmd, label) pairs sequentially in one thread."""
+    for cmd, label in cmds:
+        _run(cmd, label)
+        # stop the pipeline if a step failed
+        if _proc and _proc.returncode != 0:
+            with open(LOG_FILE, "a") as log:
+                log.write(f"\n[pipeline] step '{label}' failed (exit {_proc.returncode}) — aborting.\n")
+            break
+
+
 def _tail_log(n: int = 80) -> str:
     if not LOG_FILE.exists():
         return "(no log yet)"
@@ -63,25 +75,7 @@ def _status() -> str:
     return "⚪ Idle — ready to start"
 
 
-# ---------------------------------------------------------------------------
-# Actions
-# ---------------------------------------------------------------------------
-
-def action_prepare(limit_str: str, val_ratio: float):
-    if _proc and _proc.poll() is None:
-        return "A process is already running."
-    cmd = [sys.executable, "train.py", "prepare", "--val-ratio", str(val_ratio)]
-    try:
-        cmd += ["--limit", str(int(limit_str))]
-    except (ValueError, TypeError):
-        pass
-    threading.Thread(target=_run, args=(cmd, "prepare"), daemon=True).start()
-    return "Prepare started — see log below."
-
-
-def action_train(epochs: int, batch_size: int, lr: float, resume_path: str):
-    if _proc and _proc.poll() is None:
-        return "A process is already running."
+def _train_cmd(epochs, batch_size, lr, resume_path):
     cmd = [
         sys.executable, "train.py", "train",
         "--epochs",     str(int(epochs)),
@@ -92,7 +86,41 @@ def action_train(epochs: int, batch_size: int, lr: float, resume_path: str):
     ]
     if resume_path.strip():
         cmd += ["--resume", resume_path.strip()]
-    threading.Thread(target=_run, args=(cmd, "train"), daemon=True).start()
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+def action_prepare(limit_str, val_ratio, auto_train, epochs, batch_size, lr, resume_path):
+    if _proc and _proc.poll() is None:
+        return "A process is already running."
+
+    prepare_cmd = [sys.executable, "train.py", "prepare", "--val-ratio", str(val_ratio)]
+    try:
+        prepare_cmd += ["--limit", str(int(limit_str))]
+    except (ValueError, TypeError):
+        pass
+
+    if auto_train:
+        pipeline = [
+            (prepare_cmd, "prepare"),
+            (_train_cmd(epochs, batch_size, lr, resume_path), "train"),
+        ]
+        threading.Thread(target=_run_pipeline, args=(pipeline,), daemon=True).start()
+        return "Prepare started — training will begin automatically when done. See log below."
+    else:
+        threading.Thread(target=_run, args=(prepare_cmd, "prepare"), daemon=True).start()
+        return "Prepare started — see log below."
+
+
+def action_train(epochs, batch_size, lr, resume_path):
+    if _proc and _proc.poll() is None:
+        return "A process is already running."
+    threading.Thread(
+        target=_run, args=(_train_cmd(epochs, batch_size, lr, resume_path), "train"), daemon=True
+    ).start()
     return "Training started — see log below."
 
 
@@ -128,23 +156,34 @@ with gr.Blocks(title="Kraken+ HTR Training") as demo:
 
     status_box = gr.Textbox(label="Status", interactive=False, value=_status)
 
-    # Step 1 — Prepare
-    gr.Markdown("### Step 1 — Prepare Ground Truth (~1.5 h, ~80 GB)")
-    with gr.Row():
-        limit_in     = gr.Textbox(label="Sample limit (blank = all ~497K)", value="")
-        val_ratio_in = gr.Slider(0.05, 0.2, value=0.1, step=0.05, label="Validation ratio")
-    prepare_btn = gr.Button("Prepare GT", variant="primary")
-    prepare_out = gr.Textbox(label="", interactive=False)
-    prepare_btn.click(action_prepare, inputs=[limit_in, val_ratio_in], outputs=prepare_out)
-
-    # Step 2 — Train
-    gr.Markdown("### Step 2 — Train (~21 h)")
+    # Training params (shown above prepare so they're set before clicking)
+    gr.Markdown("### Training Parameters")
     with gr.Row():
         epochs_in     = gr.Number(label="Epochs",        value=50,   precision=0)
         batch_size_in = gr.Number(label="Batch size",    value=32,   precision=0)
         lr_in         = gr.Number(label="Learning rate", value=2e-4)
     resume_in = gr.Textbox(label="Resume from checkpoint (optional path)", value="")
-    train_btn = gr.Button("Start Training", variant="primary")
+
+    # Step 1 — Prepare (+ optional auto-chain)
+    gr.Markdown("### Step 1 — Prepare Ground Truth (~30 min)")
+    with gr.Row():
+        limit_in     = gr.Textbox(label="Sample limit (blank = all ~497K)", value="")
+        val_ratio_in = gr.Slider(0.05, 0.2, value=0.1, step=0.05, label="Validation ratio")
+    auto_train_in = gr.Checkbox(
+        label="Auto-start training immediately after prepare finishes",
+        value=True,
+    )
+    prepare_btn = gr.Button("Prepare GT  →  (Train)", variant="primary")
+    prepare_out = gr.Textbox(label="", interactive=False)
+    prepare_btn.click(
+        action_prepare,
+        inputs=[limit_in, val_ratio_in, auto_train_in, epochs_in, batch_size_in, lr_in, resume_in],
+        outputs=prepare_out,
+    )
+
+    # Step 2 — Train (manual override)
+    gr.Markdown("### Step 2 — Train (manual, only needed if auto-start is off)")
+    train_btn = gr.Button("Start Training", variant="secondary")
     train_out = gr.Textbox(label="", interactive=False)
     train_btn.click(action_train, inputs=[epochs_in, batch_size_in, lr_in, resume_in], outputs=train_out)
 
@@ -160,13 +199,13 @@ with gr.Blocks(title="Kraken+ HTR Training") as demo:
         stop_out = gr.Textbox(label="", interactive=False, scale=3)
     stop_btn.click(action_stop, outputs=stop_out)
 
-    # Live log — refreshed by a Timer every 5 s (Gradio 6.x API)
+    # Live log
     gr.Markdown("### Live Log (last 80 lines)")
     log_box = gr.Textbox(label="", interactive=False, lines=25, max_lines=25, value=_tail_log)
 
     timer = gr.Timer(value=5)
-    timer.tick(fn=_tail_log,  outputs=log_box)
-    timer.tick(fn=_status,    outputs=status_box)
+    timer.tick(fn=_tail_log, outputs=log_box)
+    timer.tick(fn=_status,   outputs=status_box)
 
 
 if __name__ == "__main__":
