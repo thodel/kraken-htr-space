@@ -41,7 +41,7 @@ VGSL_SPEC = (
     "Cr255,1,85,1,1]"
 )
 
-_BASE       = Path(__file__).parent / "data"
+_BASE       = Path("/tmp/kraken_data")
 GT_DIR      = _BASE / "ground_truth"
 MODELS_DIR  = _BASE / "models"
 LOG_FILE    = _BASE / "train.log"

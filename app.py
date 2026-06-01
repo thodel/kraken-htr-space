@@ -16,7 +16,7 @@ from pathlib import Path
 
 import gradio as gr
 
-_BASE      = Path(__file__).parent / "data"
+_BASE      = Path("/tmp/kraken_data")
 LOG_FILE   = _BASE / "train.log"
 MODELS_DIR = _BASE / "models"
 GT_DIR     = _BASE / "ground_truth"
