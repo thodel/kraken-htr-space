@@ -16,9 +16,10 @@ from pathlib import Path
 
 import gradio as gr
 
-LOG_FILE   = Path("/data/train.log")
-MODELS_DIR = Path("/data/models")
-GT_DIR     = Path("/data/ground_truth")
+_BASE      = Path(__file__).parent / "data"
+LOG_FILE   = _BASE / "train.log"
+MODELS_DIR = _BASE / "models"
+GT_DIR     = _BASE / "ground_truth"
 
 _proc: subprocess.Popen | None = None
 _stage = "idle"
