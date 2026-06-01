@@ -66,105 +66,96 @@ def _extract_text(xml_bytes: bytes) -> Optional[str]:
 # Stage 1 – prepare ground truth
 # ---------------------------------------------------------------------------
 
-# Worker function must be module-level for multiprocessing pickling
-def _process_batch(batch: dict, indices: list, img_dir: str, val_ratio: float):
-    """Called by datasets.map — converts one batch to JPEG + .gt.txt pairs."""
-    import io as _io
-    from lxml import etree as _etree
-    from PIL import Image as _Image
+def _process_one(args: tuple) -> tuple[int, Optional[str]]:
+    """Process a single (index, sample) into JPEG + .gt.txt. Thread-safe."""
+    idx, sample, img_dir = args
+    xml_raw = sample.get("xml_content") or ""
+    xml_bytes = xml_raw.encode() if isinstance(xml_raw, str) else xml_raw
+    try:
+        root = etree.fromstring(xml_bytes)
+        nodes = root.findall(".//{*}TextLine/{*}TextEquiv/{*}Unicode")
+        texts = [n.text.strip() for n in nodes if n.text and n.text.strip()]
+        text = " ".join(texts) if texts else None
+    except Exception:
+        text = None
+    if not text:
+        return idx, None
 
-    img_dir = Path(img_dir)
-    results = {"img_path": [], "has_text": []}
+    img_obj = sample["image"]
+    try:
+        if isinstance(img_obj, dict):
+            img = Image.open(io.BytesIO(img_obj["bytes"])).convert("RGB")
+        elif isinstance(img_obj, bytes):
+            img = Image.open(io.BytesIO(img_obj)).convert("RGB")
+        else:
+            img = img_obj.convert("RGB")
+    except Exception:
+        return idx, None
 
-    for idx, xml_raw, img_obj in zip(indices, batch["xml_content"], batch["image"]):
-        # --- extract text ---
-        xml_bytes = (xml_raw or "").encode() if isinstance(xml_raw, str) else (xml_raw or b"")
-        try:
-            root = _etree.fromstring(xml_bytes)
-            nodes = root.findall(".//{*}TextLine/{*}TextEquiv/{*}Unicode")
-            texts = [n.text.strip() for n in nodes if n.text and n.text.strip()]
-            text = " ".join(texts) if texts else None
-        except Exception:
-            text = None
-
-        if not text:
-            results["img_path"].append("")
-            results["has_text"].append(False)
-            continue
-
-        # --- decode image ---
-        try:
-            if isinstance(img_obj, dict):
-                img = _Image.open(_io.BytesIO(img_obj["bytes"])).convert("RGB")
-            elif isinstance(img_obj, bytes):
-                img = _Image.open(_io.BytesIO(img_obj)).convert("RGB")
-            else:
-                img = img_obj.convert("RGB")
-        except Exception:
-            results["img_path"].append("")
-            results["has_text"].append(False)
-            continue
-
-        stem = f"{idx:07d}"
-        img_path = img_dir / f"{stem}.jpg"
-        txt_path = img_dir / f"{stem}.gt.txt"
-        img.save(img_path, "JPEG", quality=95)
-        txt_path.write_text(text, encoding="utf-8")
-
-        results["img_path"].append(str(img_path))
-        results["has_text"].append(True)
-
-    return results
+    stem = f"{idx:07d}"
+    img_path = Path(img_dir) / f"{stem}.jpg"
+    img.save(img_path, "JPEG", quality=95)
+    (Path(img_dir) / f"{stem}.gt.txt").write_text(text, encoding="utf-8")
+    return idx, str(img_path)
 
 
 def prepare(limit: Optional[int], val_ratio: float):
-    import multiprocessing
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from datasets import load_dataset
 
     img_dir = GT_DIR / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    num_proc = min(8, multiprocessing.cpu_count())
+    # Streaming avoids downloading 1 TB to disk (which would fill the A100's 1 TB drive).
+    # ThreadPoolExecutor parallelises the CPU-bound JPEG encode across 8 threads,
+    # giving ~800–1600 samples/s vs 0.6 samples/s with sequential streaming.
+    N_WORKERS = 8
+    BATCH     = 128   # samples buffered before submitting to the pool
 
-    print(f"[prepare] Downloading {DATASET_ID} to local cache (num_proc={num_proc}) …", flush=True)
-    # Non-streaming: downloads all parquet files to HF cache first,
-    # then processes locally — orders of magnitude faster than streaming.
-    ds = load_dataset(DATASET_ID, split="train", num_proc=num_proc, verification_mode="no_checks")
+    print(f"[prepare] Streaming {DATASET_ID} with {N_WORKERS} worker threads …", flush=True)
+    ds = load_dataset(DATASET_ID, split="train", streaming=True)
 
-    if limit:
-        ds = ds.select(range(limit))
-        print(f"[prepare] Limited to {limit} samples", flush=True)
-
-    print(f"[prepare] Processing {len(ds):,} samples with {num_proc} workers …", flush=True)
-
-    processed = ds.map(
-        _process_batch,
-        batched=True,
-        batch_size=256,
-        with_indices=True,
-        num_proc=num_proc,
-        fn_kwargs={"img_dir": str(img_dir), "val_ratio": val_ratio},
-        desc="prepare",
-    )
-
-    # Build manifests from results
     manifest_train, manifest_val = [], []
-    skipped = 0
-    for i, row in enumerate(processed):
-        if not row["has_text"]:
-            skipped += 1
-            continue
-        entry = row["img_path"]
-        if i % round(1 / val_ratio) == 0:
-            manifest_val.append(entry)
-        else:
-            manifest_train.append(entry)
+    skipped  = 0
+    total    = 0
+    img_dir_s = str(img_dir)
+
+    with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
+        pbar = tqdm(total=limit or 497_400, desc="prepare", file=sys.stdout)
+        buf: list[tuple] = []
+
+        def flush_buf():
+            nonlocal skipped, total
+            futures = {pool.submit(_process_one, item): item[0] for item in buf}
+            for fut in as_completed(futures):
+                i, path = fut.result()
+                pbar.update(1)
+                total += 1
+                if path is None:
+                    skipped += 1
+                else:
+                    if i % round(1 / val_ratio) == 0:
+                        manifest_val.append(path)
+                    else:
+                        manifest_train.append(path)
+            buf.clear()
+
+        for i, sample in enumerate(ds):
+            if limit and i >= limit:
+                break
+            buf.append((i, sample, img_dir_s))
+            if len(buf) >= BATCH:
+                flush_buf()
+
+        if buf:
+            flush_buf()
+        pbar.close()
 
     (GT_DIR / "train.txt").write_text("\n".join(manifest_train), encoding="utf-8")
     (GT_DIR / "val.txt").write_text("\n".join(manifest_val), encoding="utf-8")
 
     stats = {
-        "total": len(processed),
+        "total": total,
         "train": len(manifest_train),
         "val": len(manifest_val),
         "skipped": skipped,
