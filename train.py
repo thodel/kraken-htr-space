@@ -3,9 +3,13 @@
 Core training logic for kraken+ on dh-unibe/image-text_medieval-scripts_xiv-xv-xvi.
 Called by app.py via subprocess so the Gradio UI stays responsive.
 
-Stages (set via --stage):
-  prepare  — stream HF dataset → PNG + .gt.txt ground-truth pairs
-  train    — invoke ketos train with the kraken+ VGSL spec
+Stages:
+  prepare   — stream HF dataset → JPEG + .gt.txt ground-truth pairs (in /tmp)
+  save-gt   — push /tmp ground-truth folder to HF Hub dataset (persistent)
+  load-gt   — restore ground-truth from HF Hub dataset back to /tmp
+  compile   — convert JPEG + .gt.txt → Arrow binary files for ketos
+  train     — invoke ketos train -f binary
+  push      — upload .mlmodel checkpoints to HF Hub model repo
 """
 
 import argparse
@@ -267,11 +271,80 @@ def train(
 
 
 # ---------------------------------------------------------------------------
+# Save / load ground truth to/from HF Hub
+# ---------------------------------------------------------------------------
+
+GT_REPO_DEFAULT = "thodel/kraken-htr-data"   # private dataset repo for GT storage
+
+
+def save_gt():
+    """
+    Push the entire ground_truth folder (JPEG + .gt.txt + manifests + Arrow files)
+    to the HF Hub dataset repo for persistent storage across Space restarts.
+    Uses upload_large_folder for efficient parallel chunked uploads.
+    """
+    from huggingface_hub import HfApi
+    token = os.environ.get("HF_TOKEN")
+    gt_repo = os.environ.get("GT_REPO", GT_REPO_DEFAULT)
+
+    if not GT_DIR.exists():
+        sys.exit("[save-gt] ERROR: ground_truth dir not found — run prepare first")
+
+    api = HfApi()
+    api.create_repo(gt_repo, repo_type="dataset", exist_ok=True, private=True, token=token)
+
+    # Count files for a progress hint
+    all_files = list(GT_DIR.rglob("*"))
+    n_files = sum(1 for f in all_files if f.is_file())
+    print(f"[save-gt] uploading {n_files:,} files → {gt_repo}", flush=True)
+
+    api.upload_folder(
+        folder_path=str(GT_DIR),
+        repo_id=gt_repo,
+        repo_type="dataset",
+        path_in_repo="ground_truth",
+        token=token,
+        ignore_patterns=["*.pyc", "__pycache__"],
+    )
+    print(f"[save-gt] done → https://huggingface.co/datasets/{gt_repo}", flush=True)
+
+
+def load_gt():
+    """
+    Download the ground_truth folder from the HF Hub dataset repo back into /tmp.
+    Skips files that already exist (idempotent — safe to re-run).
+    """
+    from huggingface_hub import snapshot_download
+    token = os.environ.get("HF_TOKEN")
+    gt_repo = os.environ.get("GT_REPO", GT_REPO_DEFAULT)
+
+    print(f"[load-gt] downloading ground_truth from {gt_repo} …", flush=True)
+    GT_DIR.mkdir(parents=True, exist_ok=True)
+
+    local_path = snapshot_download(
+        repo_id=gt_repo,
+        repo_type="dataset",
+        local_dir=str(_BASE),
+        token=token,
+        ignore_patterns=["*.gitattributes", "README.md"],
+    )
+    print(f"[load-gt] done → {local_path}", flush=True)
+
+    # Verify manifests are present
+    for f in ("train.txt", "val.txt", "stats.json"):
+        p = GT_DIR / f
+        if p.exists():
+            print(f"[load-gt] ✓ {f}", flush=True)
+        else:
+            print(f"[load-gt] ✗ {f} missing", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint upload
 # ---------------------------------------------------------------------------
 
 def push_checkpoints(output_repo: str):
-    """Upload all .mlmodel files in MODELS_DIR to the HF Hub."""
+    """Upload all .mlmodel files in MODELS_DIR to the HF Hub model repo."""
     from huggingface_hub import HfApi
     api = HfApi()
     token = os.environ.get("HF_TOKEN")
@@ -307,6 +380,8 @@ def main():
     tr.add_argument("--resume",     type=str,   default=None)
 
     sub.add_parser("compile")
+    sub.add_parser("save-gt")
+    sub.add_parser("load-gt")
 
     pu = sub.add_parser("push")
     pu.add_argument("--output-repo", type=str, required=True)
@@ -317,6 +392,10 @@ def main():
         prepare(args.limit, args.val_ratio)
     elif args.stage == "compile":
         compile_gt()
+    elif args.stage == "save-gt":
+        save_gt()
+    elif args.stage == "load-gt":
+        load_gt()
     elif args.stage == "train":
         train(args.epochs, args.batch_size, args.lr, args.resume)
     elif args.stage == "push":
