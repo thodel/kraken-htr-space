@@ -104,6 +104,7 @@ def action_prepare(limit_str, val_ratio, auto_train, epochs, batch_size, lr, res
     if auto_train:
         pipeline = [
             (prepare_cmd, "prepare"),
+            ([sys.executable, "train.py", "compile"], "compile"),
             (_train_cmd(epochs, batch_size, lr, resume_path), "train"),
         ]
         threading.Thread(target=_run_pipeline, args=(pipeline,), daemon=True).start()

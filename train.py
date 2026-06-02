@@ -165,7 +165,52 @@ def prepare(limit: Optional[int], val_ratio: float):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 – train
+# Stage 2 – compile jpg+gt.txt → Arrow binary dataset
+# ---------------------------------------------------------------------------
+
+def compile_gt():
+    """Convert .jpg + .gt.txt manifest pairs to Arrow binary files for ketos train -f binary."""
+    import pyarrow as pa
+
+    for split in ("train", "val"):
+        manifest = GT_DIR / f"{split}.txt"
+        if not manifest.exists():
+            sys.exit(f"[compile] ERROR: {manifest} not found — run prepare first")
+
+        output = GT_DIR / f"{split}.arrow"
+        paths  = [p for p in manifest.read_text().splitlines() if p.strip()]
+
+        schema = pa.schema([
+            pa.field("image", pa.binary()),
+            pa.field("text",  pa.utf8()),
+        ])
+
+        BATCH = 500
+        imgs, txts = [], []
+
+        print(f"[compile] {split}: {len(paths):,} samples → {output}", flush=True)
+        with pa.ipc.new_file(output, schema) as writer:
+            for i, img_path_str in enumerate(tqdm(paths, desc=f"compile/{split}", file=sys.stdout)):
+                img_p = Path(img_path_str)
+                gt_p  = img_p.with_suffix(".gt.txt")
+                if not img_p.exists() or not gt_p.exists():
+                    continue
+                imgs.append(img_p.read_bytes())
+                txts.append(gt_p.read_text(encoding="utf-8").strip())
+                if len(imgs) >= BATCH:
+                    writer.write_batch(pa.record_batch(
+                        [pa.array(imgs, pa.binary()), pa.array(txts, pa.utf8())], schema=schema
+                    ))
+                    imgs, txts = [], []
+            if imgs:
+                writer.write_batch(pa.record_batch(
+                    [pa.array(imgs, pa.binary()), pa.array(txts, pa.utf8())], schema=schema
+                ))
+        print(f"[compile] {split} done → {output}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 – train
 # ---------------------------------------------------------------------------
 
 def train(
@@ -192,12 +237,18 @@ def train(
     #   -B  batch size
     #   -r  learning rate
     #   --device and --workers do NOT exist in kraken 7.x (Lightning auto-detects GPU)
+    # ketos train 7.x does NOT accept '-f path' at runtime (bug: listed in --help
+    # but rejected by validation). Use '-f binary' with pre-compiled Arrow files.
+    train_arrow = GT_DIR / "train.arrow"
+    val_arrow   = GT_DIR / "val.arrow"
+    if not train_arrow.exists():
+        sys.exit("[train] ERROR: train.arrow not found — run compile first")
+
     cmd = [
         "ketos", "train",
-        "-f", "path",
+        "-f", "binary",
         "-s", VGSL_SPEC,
-        "-t", str(train_manifest),
-        "-e", str(val_manifest),
+        "-e", str(val_arrow),
         "-o", str(MODELS_DIR / "kraken_plus"),
         "-N", str(epochs),
         "-B", str(batch_size),
@@ -206,6 +257,7 @@ def train(
         "--schedule",        "reduceonplateau",
         "--lag",             "5",
         "--min-delta",       "0.005",
+        str(train_arrow),    # positional GROUND_TRUTH
     ]
     if resume:
         cmd += ["--resume", resume]
@@ -254,6 +306,8 @@ def main():
     tr.add_argument("--lr",         type=float, default=2e-4)
     tr.add_argument("--resume",     type=str,   default=None)
 
+    sub.add_parser("compile")
+
     pu = sub.add_parser("push")
     pu.add_argument("--output-repo", type=str, required=True)
 
@@ -261,6 +315,8 @@ def main():
 
     if args.stage == "prepare":
         prepare(args.limit, args.val_ratio)
+    elif args.stage == "compile":
+        compile_gt()
     elif args.stage == "train":
         train(args.epochs, args.batch_size, args.lr, args.resume)
     elif args.stage == "push":
