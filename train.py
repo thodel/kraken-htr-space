@@ -45,7 +45,7 @@ VGSL_SPEC = (
     "Cr255,1,85,1,1]"
 )
 
-_BASE       = Path("/tmp/kraken_data")
+_BASE       = Path(os.environ.get("KRAKEN_DATA_DIR", "/tmp/kraken_data"))
 GT_DIR      = _BASE / "ground_truth"
 MODELS_DIR  = _BASE / "models"
 LOG_FILE    = _BASE / "train.log"
