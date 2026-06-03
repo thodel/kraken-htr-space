@@ -221,35 +221,31 @@ def train(
     epochs: int,
     batch_size: int,
     lr: float,
+    num_gpus: int,
     resume: Optional[str],
 ):
-    """Invoke ketos train with correct kraken 7.x flags."""
+    """
+    Invoke ketos train with correct kraken 7.x flags.
+
+    Multi-GPU: the ketos root command accepts -d cuda:0,cuda:1 which is passed
+    to KrakenTrainer(devices=[0,1], accelerator='cuda') via Lightning.
+    Each GPU receives `batch_size` samples → effective batch = batch_size × num_gpus.
+    """
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    train_manifest = GT_DIR / "train.txt"
-    val_manifest   = GT_DIR / "val.txt"
-    if not train_manifest.exists():
-        sys.exit("[train] ERROR: ground truth not found — run prepare first")
-
-    # kraken 7.x ketos train flags (verified against `ketos train --help`):
-    #   -s  VGSL spec
-    #   -f  format: 'path' = image + .gt.txt sidecar pairs
-    #   -t  manifest file listing training image paths
-    #   -e  manifest file listing evaluation image paths
-    #   -o  output directory for checkpoints
-    #   -N  number of epochs
-    #   -B  batch size
-    #   -r  learning rate
-    #   --device and --workers do NOT exist in kraken 7.x (Lightning auto-detects GPU)
-    # ketos train 7.x does NOT accept '-f path' at runtime (bug: listed in --help
-    # but rejected by validation). Use '-f binary' with pre-compiled Arrow files.
     train_arrow = GT_DIR / "train.arrow"
     val_arrow   = GT_DIR / "val.arrow"
     if not train_arrow.exists():
         sys.exit("[train] ERROR: train.arrow not found — run compile first")
 
+    # Build device string: "cuda:0" for 1 GPU, "cuda:0,cuda:1" for 2, etc.
+    device_str = ",".join(f"cuda:{i}" for i in range(num_gpus))
+
     cmd = [
-        "ketos", "train",
+        "ketos",
+        "-d", device_str,
+        "--workers", str(min(8, num_gpus * 4)),  # data loader workers
+        "train",
         "-f", "binary",
         "-s", VGSL_SPEC,
         "-e", str(val_arrow),
@@ -379,6 +375,7 @@ def main():
     tr.add_argument("--epochs",     type=int,   default=50)
     tr.add_argument("--batch-size", type=int,   default=32)
     tr.add_argument("--lr",         type=float, default=2e-4)
+    tr.add_argument("--num-gpus",   type=int,   default=1)
     tr.add_argument("--resume",     type=str,   default=None)
 
     sub.add_parser("compile")
@@ -399,7 +396,7 @@ def main():
     elif args.stage == "load-gt":
         load_gt()
     elif args.stage == "train":
-        train(args.epochs, args.batch_size, args.lr, args.resume)
+        train(args.epochs, args.batch_size, args.lr, args.num_gpus, args.resume)
     elif args.stage == "push":
         push_checkpoints(args.output_repo)
 

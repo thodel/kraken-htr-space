@@ -82,11 +82,12 @@ def _py(stage: str, *extra: str) -> list[str]:
     return [sys.executable, "train.py", stage, *extra]
 
 
-def _train_cmd(epochs, batch_size, lr, resume_path):
+def _train_cmd(epochs, batch_size, lr, resume_path, num_gpus=1):
     cmd = _py("train",
               "--epochs",     str(int(epochs)),
               "--batch-size", str(int(batch_size)),
-              "--lr",         str(lr))
+              "--lr",         str(lr),
+              "--num-gpus",   str(num_gpus))
     if resume_path.strip():
         cmd += ["--resume", resume_path.strip()]
     return cmd
