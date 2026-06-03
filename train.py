@@ -298,13 +298,15 @@ def save_gt():
     n_files = sum(1 for f in all_files if f.is_file())
     print(f"[save-gt] uploading {n_files:,} files → {gt_repo}", flush=True)
 
-    api.upload_folder(
+    # upload_large_folder splits into multiple commits automatically (no 25K file limit)
+    api.upload_large_folder(
         folder_path=str(GT_DIR),
         repo_id=gt_repo,
         repo_type="dataset",
         path_in_repo="ground_truth",
         token=token,
-        ignore_patterns=["*.pyc", "__pycache__"],
+        num_workers=8,
+        print_report_every=60,
     )
     print(f"[save-gt] done → https://huggingface.co/datasets/{gt_repo}", flush=True)
 
