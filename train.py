@@ -103,6 +103,42 @@ def _process_one(args: tuple) -> tuple[int, Optional[str]]:
     return idx, str(img_path)
 
 
+PROGRESS_FILE = GT_DIR.parent / "progress.json"   # written every SAVE_EVERY items
+SAVE_EVERY    = 1_000
+
+
+def _load_progress() -> int:
+    """Return the last fully-processed stream index, or -1 if starting fresh."""
+    pf = Path(os.environ.get("KRAKEN_DATA_DIR", "/tmp/kraken_data")) / "progress.json"
+    if pf.exists():
+        try:
+            return int(json.loads(pf.read_text()).get("last_stream_index", -1))
+        except Exception:
+            pass
+    return -1
+
+
+def _save_progress(last_idx: int) -> None:
+    pf = Path(os.environ.get("KRAKEN_DATA_DIR", "/tmp/kraken_data")) / "progress.json"
+    pf.write_text(json.dumps({"last_stream_index": last_idx}))
+
+
+def _rebuild_manifests(img_dir: Path, val_ratio: float) -> dict:
+    """Scan all JPEG+.gt.txt pairs on disk and rebuild train/val manifests."""
+    manifest_train, manifest_val = [], []
+    for img_path in sorted(img_dir.glob("*.jpg")):
+        if not img_path.with_suffix(".gt.txt").exists():
+            continue
+        i = int(img_path.stem)
+        if i % round(1 / val_ratio) == 0:
+            manifest_val.append(str(img_path))
+        else:
+            manifest_train.append(str(img_path))
+    (img_dir.parent / "train.txt").write_text("\n".join(manifest_train), encoding="utf-8")
+    (img_dir.parent / "val.txt").write_text("\n".join(manifest_val), encoding="utf-8")
+    return {"train": len(manifest_train), "val": len(manifest_val)}
+
+
 def prepare(limit: Optional[int], val_ratio: float):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datasets import load_dataset
@@ -110,59 +146,88 @@ def prepare(limit: Optional[int], val_ratio: float):
     img_dir = GT_DIR / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    # Streaming avoids downloading 1 TB to disk (which would fill the A100's 1 TB drive).
-    # ThreadPoolExecutor parallelises the CPU-bound JPEG encode across 8 threads,
-    # giving ~800–1600 samples/s vs 0.6 samples/s with sequential streaming.
     N_WORKERS = 8
-    BATCH     = 128   # samples buffered before submitting to the pool
+    BATCH     = 128
 
-    print(f"[prepare] Streaming {DATASET_ID} with {N_WORKERS} worker threads …", flush=True)
+    # --- Resume support ---
+    last_done = _load_progress()
+    start_idx = last_done + 1
+
+    if start_idx > 0:
+        # Count files actually on disk to report accurate progress
+        n_on_disk = sum(1 for _ in img_dir.glob("*.jpg"))
+        print(f"[prepare] Resuming — last stream index: {last_done:,} "
+              f"| files on disk: {n_on_disk:,}", flush=True)
+    else:
+        print(f"[prepare] Starting fresh", flush=True)
+
+    print(f"[prepare] Streaming {DATASET_ID} from index {start_idx:,} …", flush=True)
     ds = load_dataset(DATASET_ID, split="train", streaming=True)
+    if start_idx > 0:
+        ds = ds.skip(start_idx)
 
-    manifest_train, manifest_val = [], []
-    skipped  = 0
-    total    = 0
+    skipped   = 0
+    new_total = 0
     img_dir_s = str(img_dir)
+    last_saved_idx = last_done
 
     with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-        pbar = tqdm(total=limit or 497_400, desc="prepare", file=sys.stdout)
+        effective_limit = (limit - start_idx) if limit else None
+        pbar = tqdm(
+            total=effective_limit or max(0, (limit or 497_400) - start_idx),
+            desc="prepare",
+            file=sys.stdout,
+            initial=0,
+        )
         buf: list[tuple] = []
 
-        def flush_buf():
-            nonlocal skipped, total
+        def flush_buf(up_to_idx: int):
+            nonlocal skipped, new_total, last_saved_idx
             futures = {pool.submit(_process_one, item): item[0] for item in buf}
             for fut in as_completed(futures):
-                i, path = fut.result()
+                stream_i, path = fut.result()
                 pbar.update(1)
-                total += 1
+                new_total += 1
                 if path is None:
                     skipped += 1
-                else:
-                    if i % round(1 / val_ratio) == 0:
-                        manifest_val.append(path)
-                    else:
-                        manifest_train.append(path)
             buf.clear()
+            # Persist progress checkpoint
+            if up_to_idx - last_saved_idx >= SAVE_EVERY:
+                _save_progress(up_to_idx)
+                last_saved_idx = up_to_idx
 
-        for i, sample in enumerate(ds):
+        for offset, sample in enumerate(ds):
+            i = start_idx + offset
             if limit and i >= limit:
                 break
+
+            img_path = img_dir / f"{i:07d}.jpg"
+            gt_path  = img_dir / f"{i:07d}.gt.txt"
+            if img_path.exists() and gt_path.exists():
+                # Already on disk from a previous interrupted run — skip
+                pbar.update(1)
+                new_total += 1
+                continue
+
             buf.append((i, sample, img_dir_s))
             if len(buf) >= BATCH:
-                flush_buf()
+                flush_buf(i)
 
         if buf:
-            flush_buf()
+            flush_buf(start_idx + offset)
         pbar.close()
 
-    (GT_DIR / "train.txt").write_text("\n".join(manifest_train), encoding="utf-8")
-    (GT_DIR / "val.txt").write_text("\n".join(manifest_val), encoding="utf-8")
+    # Save final progress
+    final_idx = start_idx + offset if 'offset' in dir() else last_done
+    _save_progress(final_idx)
 
+    # Rebuild manifests from everything on disk (old + new)
+    counts = _rebuild_manifests(img_dir, val_ratio)
     stats = {
-        "total": total,
-        "train": len(manifest_train),
-        "val": len(manifest_val),
-        "skipped": skipped,
+        "last_stream_index": final_idx,
+        "new_this_run": new_total,
+        "skipped_this_run": skipped,
+        **counts,
     }
     (GT_DIR / "stats.json").write_text(json.dumps(stats, indent=2))
     print(f"[prepare] done — {json.dumps(stats)}", flush=True)
