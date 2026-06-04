@@ -56,6 +56,14 @@ fi
 source "$VENV_DIR/bin/activate"
 export KRAKEN_DATA_DIR KRAKEN_MODELS_DIR GT_REPO
 
+# Redirect HuggingFace cache to the mount so ~/.cache and /tmp don't fill up
+HF_CACHE_DIR="$KRAKEN_DATA_DIR/.hf_cache"
+mkdir -p "$HF_CACHE_DIR"
+export HF_HOME="$HF_CACHE_DIR"
+export HF_DATASETS_CACHE="$HF_CACHE_DIR/datasets"
+export TRANSFORMERS_CACHE="$HF_CACHE_DIR/transformers"
+export HF_HUB_CACHE="$HF_CACHE_DIR/hub"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
