@@ -70,21 +70,69 @@ def _extract_text(xml_bytes: bytes) -> Optional[str]:
 # Stage 1 – prepare ground truth
 # ---------------------------------------------------------------------------
 
-def _process_one(args: tuple) -> tuple[int, Optional[str]]:
-    """Process a single (index, sample) into JPEG + .gt.txt. Thread-safe."""
-    idx, sample, img_dir = args
-    xml_raw = sample.get("xml_content") or ""
-    xml_bytes = xml_raw.encode() if isinstance(xml_raw, str) else xml_raw
+def _extract_line_crops(
+    xml_bytes: bytes,
+    img: Image.Image,
+    page_idx: int,
+    img_dir: Path,
+) -> list[str]:
+    """
+    Parse PageXML, crop each TextLine from the page image, save as
+    JPEG + .gt.txt.  Returns list of saved image paths.
+
+    Naming: {page_idx:07d}_{line_idx:04d}.jpg
+    """
+    saved = []
     try:
         root = etree.fromstring(xml_bytes)
-        nodes = root.findall(".//{*}TextLine/{*}TextEquiv/{*}Unicode")
-        texts = [n.text.strip() for n in nodes if n.text and n.text.strip()]
-        text = " ".join(texts) if texts else None
-    except Exception:
-        text = None
-    if not text:
-        return idx, None
+    except etree.XMLSyntaxError:
+        return saved
 
+    for line_idx, ln in enumerate(root.findall(".//{*}TextLine")):
+        # --- transcription ---
+        u = ln.find(".//{*}TextEquiv/{*}Unicode")
+        text = (u.text or "").strip() if u is not None else ""
+        if not text:
+            continue
+
+        # --- bounding box from polygon Coords ---
+        coords_el = ln.find(".//{*}Coords")
+        if coords_el is None:
+            continue
+        pts_str = coords_el.get("points", "").strip()
+        if not pts_str:
+            continue
+        try:
+            pts = [(int(a), int(b)) for a, b in (p.split(",") for p in pts_str.split())]
+            x0 = max(0,          min(p[0] for p in pts))
+            y0 = max(0,          min(p[1] for p in pts))
+            x1 = min(img.width,  max(p[0] for p in pts))
+            y1 = min(img.height, max(p[1] for p in pts))
+        except (ValueError, IndexError):
+            continue
+
+        if x1 - x0 < 20 or y1 - y0 < 10:   # skip degenerate crops
+            continue
+
+        crop = img.crop((x0, y0, x1, y1))
+        stem     = f"{page_idx:07d}_{line_idx:04d}"
+        img_path = img_dir / f"{stem}.jpg"
+        gt_path  = img_dir / f"{stem}.gt.txt"
+        crop.save(img_path, "JPEG", quality=95)
+        gt_path.write_text(text, encoding="utf-8")
+        saved.append(str(img_path))
+
+    return saved
+
+
+def _process_one(args: tuple) -> tuple[int, list[str]]:
+    """
+    Process one page sample: decode image, extract all TextLine crops,
+    write JPEG + .gt.txt per line.  Returns (page_idx, [saved_paths]).
+    """
+    idx, sample, img_dir = args
+
+    # Decode page image
     img_obj = sample["image"]
     try:
         if isinstance(img_obj, dict):
@@ -94,13 +142,12 @@ def _process_one(args: tuple) -> tuple[int, Optional[str]]:
         else:
             img = img_obj.convert("RGB")
     except Exception:
-        return idx, None
+        return idx, []
 
-    stem = f"{idx:07d}"
-    img_path = Path(img_dir) / f"{stem}.jpg"
-    img.save(img_path, "JPEG", quality=95)
-    (Path(img_dir) / f"{stem}.gt.txt").write_text(text, encoding="utf-8")
-    return idx, str(img_path)
+    xml_raw   = sample.get("xml_content") or ""
+    xml_bytes = xml_raw.encode() if isinstance(xml_raw, str) else xml_raw
+    paths     = _extract_line_crops(xml_bytes, img, idx, Path(img_dir))
+    return idx, paths
 
 
 PROGRESS_FILE = GT_DIR.parent / "progress.json"   # written every SAVE_EVERY items
@@ -124,13 +171,22 @@ def _save_progress(last_idx: int) -> None:
 
 
 def _rebuild_manifests(img_dir: Path, val_ratio: float) -> dict:
-    """Scan all JPEG+.gt.txt pairs on disk and rebuild train/val manifests."""
+    """
+    Scan all JPEG+.gt.txt line-crop pairs and rebuild train/val manifests.
+    Files are named {page_idx:07d}_{line_idx:04d}.jpg; val split is based
+    on page_idx so whole pages go to one split (no line leakage).
+    """
     manifest_train, manifest_val = [], []
+    val_step = round(1 / val_ratio)
     for img_path in sorted(img_dir.glob("*.jpg")):
         if not img_path.with_suffix(".gt.txt").exists():
             continue
-        i = int(img_path.stem)
-        if i % round(1 / val_ratio) == 0:
+        # extract page index from stem "PPPPPPP_LLLL"
+        try:
+            page_idx = int(img_path.stem.split("_")[0])
+        except ValueError:
+            continue
+        if page_idx % val_step == 0:
             manifest_val.append(str(img_path))
         else:
             manifest_train.append(str(img_path))
@@ -172,26 +228,24 @@ def prepare(limit: Optional[int], val_ratio: float):
     last_saved_idx = last_done
 
     with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-        effective_limit = (limit - start_idx) if limit else None
         pbar = tqdm(
-            total=effective_limit or max(0, (limit or 497_400) - start_idx),
-            desc="prepare",
+            total=max(0, (limit or 497_400) - start_idx),
+            desc="prepare (pages)",
             file=sys.stdout,
-            initial=0,
         )
         buf: list[tuple] = []
+        offset = -1
 
         def flush_buf(up_to_idx: int):
             nonlocal skipped, new_total, last_saved_idx
             futures = {pool.submit(_process_one, item): item[0] for item in buf}
             for fut in as_completed(futures):
-                stream_i, path = fut.result()
+                _, paths = fut.result()
                 pbar.update(1)
                 new_total += 1
-                if path is None:
+                if not paths:
                     skipped += 1
             buf.clear()
-            # Persist progress checkpoint
             if up_to_idx - last_saved_idx >= SAVE_EVERY:
                 _save_progress(up_to_idx)
                 last_saved_idx = up_to_idx
@@ -201,10 +255,9 @@ def prepare(limit: Optional[int], val_ratio: float):
             if limit and i >= limit:
                 break
 
-            img_path = img_dir / f"{i:07d}.jpg"
-            gt_path  = img_dir / f"{i:07d}.gt.txt"
-            if img_path.exists() and gt_path.exists():
-                # Already on disk from a previous interrupted run — skip
+            # Resume check: if the first line crop for this page exists, skip it
+            first_crop = img_dir / f"{i:07d}_0000.jpg"
+            if first_crop.exists():
                 pbar.update(1)
                 new_total += 1
                 continue
@@ -218,19 +271,23 @@ def prepare(limit: Optional[int], val_ratio: float):
         pbar.close()
 
     # Save final progress
-    final_idx = start_idx + offset if 'offset' in dir() else last_done
+    final_idx = start_idx + offset if offset >= 0 else last_done
     _save_progress(final_idx)
 
     # Rebuild manifests from everything on disk (old + new)
     counts = _rebuild_manifests(img_dir, val_ratio)
+    total_lines = counts["train"] + counts["val"]
     stats = {
         "last_stream_index": final_idx,
-        "new_this_run": new_total,
-        "skipped_this_run": skipped,
+        "pages_this_run": new_total,
+        "pages_skipped_no_lines": skipped,
+        "total_line_crops": total_lines,
         **counts,
     }
     (GT_DIR / "stats.json").write_text(json.dumps(stats, indent=2))
     print(f"[prepare] done — {json.dumps(stats)}", flush=True)
+    print(f"[prepare] ~{total_lines:,} line crops total "
+          f"(~{total_lines/(final_idx+1):.1f} lines/page avg)", flush=True)
 
 
 # ---------------------------------------------------------------------------
