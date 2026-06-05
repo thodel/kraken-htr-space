@@ -217,6 +217,10 @@ def prepare(limit: Optional[int], val_ratio: float):
     else:
         print(f"[prepare] Starting fresh", flush=True)
 
+    # Disable on-disk caching — we stream through once, no need to cache parquets
+    from datasets import disable_caching
+    disable_caching()
+
     print(f"[prepare] Streaming {DATASET_ID} from index {start_idx:,} …", flush=True)
     ds = load_dataset(DATASET_ID, split="train", streaming=True)
     if start_idx > 0:
