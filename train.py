@@ -4,10 +4,12 @@ Core training logic for kraken+ on dh-unibe/image-text_medieval-scripts_xiv-xv-x
 Called by app.py via subprocess so the Gradio UI stays responsive.
 
 Stages:
-  prepare   — stream HF dataset → JPEG + .gt.txt ground-truth pairs (in /tmp)
-  save-gt   — push /tmp ground-truth folder to HF Hub dataset (persistent)
-  load-gt   — restore ground-truth from HF Hub dataset back to /tmp
-  compile   — convert JPEG + .gt.txt → Arrow binary files for ketos
+  prepare   — stream HF dataset, extract TextLine crops, write Arrow chunks
+              directly (no intermediate JPEG files → no inode exhaustion).
+              On completion merges chunks into train.arrow + val.arrow.
+  save-gt   — push ground_truth/ folder to HF Hub dataset (persistent)
+  load-gt   — restore ground_truth/ from HF Hub dataset
+  compile   — no-op if Arrow files already exist (kept for compatibility)
   train     — invoke ketos train -f binary
   push      — upload .mlmodel checkpoints to HF Hub model repo
 """
@@ -51,51 +53,87 @@ MODELS_DIR  = Path(os.environ.get("KRAKEN_MODELS_DIR", str(_BASE / "models")))
 LOG_FILE    = _BASE / "train.log"
 
 # ---------------------------------------------------------------------------
-# PageXML helpers
+# Stage 1 – prepare: stream → Arrow chunks → merge (no intermediate files)
+#
+# Creates only:  ground_truth/chunks/NNNNNNN.arrow  (one per CHUNK_PAGES pages)
+#                ground_truth/train.arrow
+#                ground_truth/val.arrow
+#                progress.json
+# Zero JPEG / .gt.txt files → no inode exhaustion.
 # ---------------------------------------------------------------------------
 
-def _extract_text(xml_bytes: bytes) -> Optional[str]:
+# Arrow schemas
+_CHUNK_SCHEMA = None   # lazy-initialised (avoids importing pyarrow at module load)
+_FINAL_SCHEMA = None
+
+CHUNK_PAGES  = 5_000   # pages per chunk file  (~75K lines, ~2 GB per chunk)
+WRITE_LINES  = 1_000   # lines per Arrow record batch
+N_WORKERS    = 8
+PAGE_BATCH   = 128     # pages buffered before flushing to Arrow
+
+
+def _arrow_schemas():
+    import pyarrow as pa
+    global _CHUNK_SCHEMA, _FINAL_SCHEMA
+    if _CHUNK_SCHEMA is None:
+        _CHUNK_SCHEMA = pa.schema([
+            pa.field("image",    pa.binary()),
+            pa.field("text",     pa.utf8()),
+            pa.field("page_idx", pa.int32()),
+        ])
+        _FINAL_SCHEMA = pa.schema([
+            pa.field("image", pa.binary()),
+            pa.field("text",  pa.utf8()),
+        ])
+    return _CHUNK_SCHEMA, _FINAL_SCHEMA
+
+
+def _load_progress() -> int:
+    pf = _BASE / "progress.json"
+    if pf.exists():
+        try:
+            return int(json.loads(pf.read_text()).get("last_stream_index", -1))
+        except Exception:
+            pass
+    return -1
+
+
+def _save_progress(last_idx: int) -> None:
+    _BASE.mkdir(parents=True, exist_ok=True)
+    (_BASE / "progress.json").write_text(json.dumps({"last_stream_index": last_idx}))
+
+
+def _line_crops_from_page(sample: dict) -> list[tuple[bytes, str]]:
+    """
+    Decode a page image + PageXML and return (jpeg_bytes, text) for every
+    valid TextLine crop.  Pure function — no disk I/O.
+    """
+    img_obj = sample["image"]
+    try:
+        if isinstance(img_obj, dict):
+            img = Image.open(io.BytesIO(img_obj["bytes"])).convert("RGB")
+        elif isinstance(img_obj, bytes):
+            img = Image.open(io.BytesIO(img_obj)).convert("RGB")
+        else:
+            img = img_obj.convert("RGB")
+    except Exception:
+        return []
+
+    xml_raw   = sample.get("xml_content") or ""
+    xml_bytes = xml_raw.encode() if isinstance(xml_raw, str) else xml_raw
+
+    results = []
     try:
         root = etree.fromstring(xml_bytes)
     except etree.XMLSyntaxError:
-        return None
-    nodes = root.findall(".//{*}TextLine/{*}TextEquiv/{*}Unicode")
-    if not nodes:
-        return None
-    texts = [n.text.strip() for n in nodes if n.text and n.text.strip()]
-    return " ".join(texts) if texts else None
+        return results
 
-
-# ---------------------------------------------------------------------------
-# Stage 1 – prepare ground truth
-# ---------------------------------------------------------------------------
-
-def _extract_line_crops(
-    xml_bytes: bytes,
-    img: Image.Image,
-    page_idx: int,
-    img_dir: Path,
-) -> list[str]:
-    """
-    Parse PageXML, crop each TextLine from the page image, save as
-    JPEG + .gt.txt.  Returns list of saved image paths.
-
-    Naming: {page_idx:07d}_{line_idx:04d}.jpg
-    """
-    saved = []
-    try:
-        root = etree.fromstring(xml_bytes)
-    except etree.XMLSyntaxError:
-        return saved
-
-    for line_idx, ln in enumerate(root.findall(".//{*}TextLine")):
-        # --- transcription ---
-        u = ln.find(".//{*}TextEquiv/{*}Unicode")
+    for ln in root.findall(".//{*}TextLine"):
+        u    = ln.find(".//{*}TextEquiv/{*}Unicode")
         text = (u.text or "").strip() if u is not None else ""
         if not text:
             continue
 
-        # --- bounding box from polygon Coords ---
         coords_el = ln.find(".//{*}Coords")
         if coords_el is None:
             continue
@@ -111,233 +149,202 @@ def _extract_line_crops(
         except (ValueError, IndexError):
             continue
 
-        if x1 - x0 < 20 or y1 - y0 < 10:   # skip degenerate crops
+        if x1 - x0 < 20 or y1 - y0 < 10:
             continue
 
-        crop = img.crop((x0, y0, x1, y1))
-        stem     = f"{page_idx:07d}_{line_idx:04d}"
-        img_path = img_dir / f"{stem}.jpg"
-        gt_path  = img_dir / f"{stem}.gt.txt"
-        crop.save(img_path, "JPEG", quality=95)
-        gt_path.write_text(text, encoding="utf-8")
-        saved.append(str(img_path))
+        buf = io.BytesIO()
+        img.crop((x0, y0, x1, y1)).save(buf, "JPEG", quality=95)
+        results.append((buf.getvalue(), text))
 
-    return saved
+    return results
 
 
-def _process_one(args: tuple) -> tuple[int, list[str]]:
-    """
-    Process one page sample: decode image, extract all TextLine crops,
-    write JPEG + .gt.txt per line.  Returns (page_idx, [saved_paths]).
-    """
-    idx, sample, img_dir = args
-
-    # Decode page image
-    img_obj = sample["image"]
-    try:
-        if isinstance(img_obj, dict):
-            img = Image.open(io.BytesIO(img_obj["bytes"])).convert("RGB")
-        elif isinstance(img_obj, bytes):
-            img = Image.open(io.BytesIO(img_obj)).convert("RGB")
-        else:
-            img = img_obj.convert("RGB")
-    except Exception:
-        return idx, []
-
-    xml_raw   = sample.get("xml_content") or ""
-    xml_bytes = xml_raw.encode() if isinstance(xml_raw, str) else xml_raw
-    paths     = _extract_line_crops(xml_bytes, img, idx, Path(img_dir))
-    return idx, paths
+def _process_one(args: tuple) -> tuple[int, list[tuple[bytes, str]]]:
+    """Thread worker: returns (page_idx, [(jpeg_bytes, text), …])."""
+    idx, sample = args
+    return idx, _line_crops_from_page(sample)
 
 
-PROGRESS_FILE = GT_DIR.parent / "progress.json"   # written every SAVE_EVERY items
-SAVE_EVERY    = 1_000
+def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
+    """Merge all chunk Arrow files into train.arrow + val.arrow."""
+    import pyarrow as pa
+    _, final_schema = _arrow_schemas()
 
+    val_step    = round(1 / val_ratio)
+    chunk_files = sorted(chunks_dir.glob("*.arrow"))
+    print(f"[merge] {len(chunk_files)} chunk files → train.arrow + val.arrow", flush=True)
 
-def _load_progress() -> int:
-    """Return the last fully-processed stream index, or -1 if starting fresh."""
-    pf = Path(os.environ.get("KRAKEN_DATA_DIR", "/tmp/kraken_data")) / "progress.json"
-    if pf.exists():
-        try:
-            return int(json.loads(pf.read_text()).get("last_stream_index", -1))
-        except Exception:
-            pass
-    return -1
+    n_train = n_val = 0
+    with pa.ipc.new_file(gt_dir / "train.arrow", final_schema) as tw, \
+         pa.ipc.new_file(gt_dir / "val.arrow",   final_schema) as vw:
 
+        for cf in tqdm(chunk_files, desc="merge chunks", file=sys.stdout):
+            with pa.ipc.open_file(cf) as reader:
+                for bi in range(reader.num_record_batches):
+                    batch     = reader.get_batch(bi)
+                    page_idxs = batch.column("page_idx").to_pylist()
+                    t_idx = [i for i, p in enumerate(page_idxs) if p % val_step != 0]
+                    v_idx = [i for i, p in enumerate(page_idxs) if p % val_step == 0]
+                    if t_idx:
+                        tw.write_batch(pa.record_batch([
+                            batch.column("image").take(t_idx),
+                            batch.column("text").take(t_idx),
+                        ], schema=final_schema))
+                        n_train += len(t_idx)
+                    if v_idx:
+                        vw.write_batch(pa.record_batch([
+                            batch.column("image").take(v_idx),
+                            batch.column("text").take(v_idx),
+                        ], schema=final_schema))
+                        n_val += len(v_idx)
 
-def _save_progress(last_idx: int) -> None:
-    pf = Path(os.environ.get("KRAKEN_DATA_DIR", "/tmp/kraken_data")) / "progress.json"
-    pf.write_text(json.dumps({"last_stream_index": last_idx}))
-
-
-def _rebuild_manifests(img_dir: Path, val_ratio: float) -> dict:
-    """
-    Scan all JPEG+.gt.txt line-crop pairs and rebuild train/val manifests.
-    Files are named {page_idx:07d}_{line_idx:04d}.jpg; val split is based
-    on page_idx so whole pages go to one split (no line leakage).
-    """
-    manifest_train, manifest_val = [], []
-    val_step = round(1 / val_ratio)
-    for img_path in sorted(img_dir.glob("*.jpg")):
-        if not img_path.with_suffix(".gt.txt").exists():
-            continue
-        # extract page index from stem "PPPPPPP_LLLL"
-        try:
-            page_idx = int(img_path.stem.split("_")[0])
-        except ValueError:
-            continue
-        if page_idx % val_step == 0:
-            manifest_val.append(str(img_path))
-        else:
-            manifest_train.append(str(img_path))
-    (img_dir.parent / "train.txt").write_text("\n".join(manifest_train), encoding="utf-8")
-    (img_dir.parent / "val.txt").write_text("\n".join(manifest_val), encoding="utf-8")
-    return {"train": len(manifest_train), "val": len(manifest_val)}
+    print(f"[merge] done — train: {n_train:,}  val: {n_val:,}", flush=True)
+    return {"train": n_train, "val": n_val}
 
 
 def prepare(limit: Optional[int], val_ratio: float):
+    import pyarrow as pa
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from datasets import load_dataset
+    from datasets import load_dataset, disable_caching
 
-    img_dir = GT_DIR / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
+    chunk_schema, _ = _arrow_schemas()
+    chunks_dir = GT_DIR / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    GT_DIR.mkdir(parents=True, exist_ok=True)
 
-    N_WORKERS = 8
-    BATCH     = 128
-
-    # --- Resume support ---
+    # Resume
     last_done = _load_progress()
     start_idx = last_done + 1
-
+    n_chunks  = len(list(chunks_dir.glob("*.arrow")))
     if start_idx > 0:
-        # Count files actually on disk to report accurate progress
-        n_on_disk = sum(1 for _ in img_dir.glob("*.jpg"))
-        print(f"[prepare] Resuming — last stream index: {last_done:,} "
-              f"| files on disk: {n_on_disk:,}", flush=True)
+        print(f"[prepare] Resuming from page {start_idx:,} | {n_chunks} chunks on disk", flush=True)
     else:
         print(f"[prepare] Starting fresh", flush=True)
 
-    # Disable on-disk caching — we stream through once, no need to cache parquets
-    from datasets import disable_caching
     disable_caching()
-
     print(f"[prepare] Streaming {DATASET_ID} from index {start_idx:,} …", flush=True)
     ds = load_dataset(DATASET_ID, split="train", streaming=True)
     if start_idx > 0:
         ds = ds.skip(start_idx)
 
-    skipped   = 0
-    new_total = 0
-    img_dir_s = str(img_dir)
-    last_saved_idx = last_done
+    # Mutable chunk-writer state (wrapped in list to allow reassignment in closures)
+    cw_state = {
+        "start":  start_idx,
+        "count":  0,
+        "writer": pa.ipc.new_file(chunks_dir / f"{start_idx:07d}.arrow", chunk_schema),
+    }
+    # Line batch buffers
+    b_imgs: list[bytes] = []
+    b_txts: list[str]   = []
+    b_pidx: list[int]   = []
+
+    total_pages = total_lines = skipped = 0
+    offset = -1
+
+    def _flush_lines():
+        if not b_imgs:
+            return
+        cw_state["writer"].write_batch(pa.record_batch([
+            pa.array(b_imgs, pa.binary()),
+            pa.array(b_txts, pa.utf8()),
+            pa.array(b_pidx, pa.int32()),
+        ], schema=chunk_schema))
+        b_imgs.clear(); b_txts.clear(); b_pidx.clear()
+
+    def _rotate_chunk(up_to_page: int):
+        _flush_lines()
+        cw_state["writer"].close()
+        _save_progress(up_to_page)
+        print(f"[prepare] chunk {cw_state['start']:07d}.arrow saved "
+              f"(pages {cw_state['start']:,}–{up_to_page:,})", flush=True)
+        nxt = up_to_page + 1
+        cw_state.update({
+            "start":  nxt,
+            "count":  0,
+            "writer": pa.ipc.new_file(chunks_dir / f"{nxt:07d}.arrow", chunk_schema),
+        })
 
     with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
-        pbar = tqdm(
-            total=max(0, (limit or 497_400) - start_idx),
-            desc="prepare (pages)",
-            file=sys.stdout,
-        )
+        pbar = tqdm(total=max(0, (limit or 497_400) - start_idx),
+                    desc="prepare (pages)", file=sys.stdout)
         buf: list[tuple] = []
-        offset = -1
+        max_i = start_idx
 
-        def flush_buf(up_to_idx: int):
-            nonlocal skipped, new_total, last_saved_idx
-            futures = {pool.submit(_process_one, item): item[0] for item in buf}
-            for fut in as_completed(futures):
-                _, paths = fut.result()
+        def flush_buf():
+            nonlocal total_pages, total_lines, skipped
+            futs = {pool.submit(_process_one, item): item[0] for item in buf}
+            for fut in as_completed(futs):
+                page_idx, crops = fut.result()
                 pbar.update(1)
-                new_total += 1
-                if not paths:
+                total_pages += 1
+                cw_state["count"] += 1
+                if not crops:
                     skipped += 1
+                for img_b, txt in crops:
+                    b_imgs.append(img_b); b_txts.append(txt); b_pidx.append(page_idx)
+                    total_lines += 1
+                    if len(b_imgs) >= WRITE_LINES:
+                        _flush_lines()
             buf.clear()
-            if up_to_idx - last_saved_idx >= SAVE_EVERY:
-                _save_progress(up_to_idx)
-                last_saved_idx = up_to_idx
+            if cw_state["count"] >= CHUNK_PAGES:
+                _rotate_chunk(max_i)
 
         for offset, sample in enumerate(ds):
             i = start_idx + offset
             if limit and i >= limit:
                 break
-
-            # Resume check: if the first line crop for this page exists, skip it
-            first_crop = img_dir / f"{i:07d}_0000.jpg"
-            if first_crop.exists():
+            # Resume check: skip pages already in a completed chunk
+            chunk_file = chunks_dir / f"{(i // CHUNK_PAGES) * CHUNK_PAGES:07d}.arrow"
+            if chunk_file.exists() and i < last_done:
                 pbar.update(1)
-                new_total += 1
+                total_pages += 1
                 continue
-
-            buf.append((i, sample, img_dir_s))
-            if len(buf) >= BATCH:
-                flush_buf(i)
+            buf.append((i, sample))
+            max_i = i
+            if len(buf) >= PAGE_BATCH:
+                flush_buf()
 
         if buf:
-            flush_buf(start_idx + offset)
+            flush_buf()
         pbar.close()
 
-    # Save final progress
+    # Close final (possibly partial) chunk
+    _flush_lines()
+    cw_state["writer"].close()
     final_idx = start_idx + offset if offset >= 0 else last_done
     _save_progress(final_idx)
 
-    # Rebuild manifests from everything on disk (old + new)
-    counts = _rebuild_manifests(img_dir, val_ratio)
-    total_lines = counts["train"] + counts["val"]
-    stats = {
+    # Merge all chunks → train.arrow + val.arrow
+    counts = _merge_chunks(chunks_dir, GT_DIR, val_ratio)
+    stats  = {
         "last_stream_index": final_idx,
-        "pages_this_run": new_total,
+        "total_pages": total_pages,
+        "total_lines": total_lines,
         "pages_skipped_no_lines": skipped,
-        "total_line_crops": total_lines,
         **counts,
     }
     (GT_DIR / "stats.json").write_text(json.dumps(stats, indent=2))
     print(f"[prepare] done — {json.dumps(stats)}", flush=True)
-    print(f"[prepare] ~{total_lines:,} line crops total "
-          f"(~{total_lines/(final_idx+1):.1f} lines/page avg)", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 – compile jpg+gt.txt → Arrow binary dataset
+# Stage 2 – compile (no-op: prepare now writes Arrow directly)
 # ---------------------------------------------------------------------------
 
 def compile_gt():
-    """Convert .jpg + .gt.txt manifest pairs to Arrow binary files for ketos train -f binary."""
-    import pyarrow as pa
+    """No-op: prepare() now writes train.arrow + val.arrow directly.
+    Kept so existing pipelines that call 'compile' don't break."""
+    train_arrow = GT_DIR / "train.arrow"
+    val_arrow   = GT_DIR / "val.arrow"
+    if train_arrow.exists() and val_arrow.exists():
+        print("[compile] Arrow files already present — skipping (prepare wrote them directly)", flush=True)
+        return
+    sys.exit("[compile] ERROR: Arrow files not found — run prepare first")
 
-    for split in ("train", "val"):
-        manifest = GT_DIR / f"{split}.txt"
-        if not manifest.exists():
-            sys.exit(f"[compile] ERROR: {manifest} not found — run prepare first")
 
-        output = GT_DIR / f"{split}.arrow"
-        paths  = [p for p in manifest.read_text().splitlines() if p.strip()]
-
-        schema = pa.schema([
-            pa.field("image", pa.binary()),
-            pa.field("text",  pa.utf8()),
-        ])
-
-        BATCH = 500
-        imgs, txts = [], []
-
-        print(f"[compile] {split}: {len(paths):,} samples → {output}", flush=True)
-        with pa.ipc.new_file(output, schema) as writer:
-            for i, img_path_str in enumerate(tqdm(paths, desc=f"compile/{split}", file=sys.stdout)):
-                img_p = Path(img_path_str)
-                gt_p  = img_p.with_suffix(".gt.txt")
-                if not img_p.exists() or not gt_p.exists():
-                    continue
-                imgs.append(img_p.read_bytes())
-                txts.append(gt_p.read_text(encoding="utf-8").strip())
-                if len(imgs) >= BATCH:
-                    writer.write_batch(pa.record_batch(
-                        [pa.array(imgs, pa.binary()), pa.array(txts, pa.utf8())], schema=schema
-                    ))
-                    imgs, txts = [], []
-            if imgs:
-                writer.write_batch(pa.record_batch(
-                    [pa.array(imgs, pa.binary()), pa.array(txts, pa.utf8())], schema=schema
-                ))
-        print(f"[compile] {split} done → {output}", flush=True)
-
+# ---------------------------------------------------------------------------
+# (old compile helper kept only for reference — no longer called)
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Stage 3 – train
