@@ -166,7 +166,15 @@ def _process_one(args: tuple) -> tuple[int, list[tuple[bytes, str]]]:
 
 
 def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
-    """Merge all chunk Arrow files into train.arrow + val.arrow."""
+    """
+    Merge all chunk Arrow files into train.arrow + val.arrow.
+
+    Robustness:
+    - Each chunk is deleted after successful merge → peak disk = chunks + output,
+      not chunks + output simultaneously (cuts disk need roughly in half).
+    - Corrupt / incomplete chunks (missing Arrow footer) are skipped with a
+      warning; their page ranges are printed so prepare can re-process them.
+    """
     import pyarrow as pa
     _, final_schema = _arrow_schemas()
 
@@ -175,31 +183,51 @@ def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
     print(f"[merge] {len(chunk_files)} chunk files → train.arrow + val.arrow", flush=True)
 
     n_train = n_val = 0
+    corrupt: list[Path] = []
+
     with pa.ipc.new_file(gt_dir / "train.arrow", final_schema) as tw, \
          pa.ipc.new_file(gt_dir / "val.arrow",   final_schema) as vw:
 
         for cf in tqdm(chunk_files, desc="merge chunks", file=sys.stdout):
-            with pa.ipc.open_file(cf) as reader:
-                for bi in range(reader.num_record_batches):
-                    batch     = reader.get_batch(bi)
-                    page_idxs = batch.column("page_idx").to_pylist()
-                    t_idx = [i for i, p in enumerate(page_idxs) if p % val_step != 0]
-                    v_idx = [i for i, p in enumerate(page_idxs) if p % val_step == 0]
-                    if t_idx:
-                        tw.write_batch(pa.record_batch([
-                            batch.column("image").take(t_idx),
-                            batch.column("text").take(t_idx),
-                        ], schema=final_schema))
-                        n_train += len(t_idx)
-                    if v_idx:
-                        vw.write_batch(pa.record_batch([
-                            batch.column("image").take(v_idx),
-                            batch.column("text").take(v_idx),
-                        ], schema=final_schema))
-                        n_val += len(v_idx)
+            try:
+                with pa.ipc.open_file(cf) as reader:
+                    for bi in range(reader.num_record_batches):
+                        batch     = reader.get_batch(bi)
+                        page_idxs = batch.column("page_idx").to_pylist()
+                        t_idx = [i for i, p in enumerate(page_idxs) if p % val_step != 0]
+                        v_idx = [i for i, p in enumerate(page_idxs) if p % val_step == 0]
+                        if t_idx:
+                            tw.write_batch(pa.record_batch([
+                                batch.column("image").take(t_idx),
+                                batch.column("text").take(t_idx),
+                            ], schema=final_schema))
+                            n_train += len(t_idx)
+                        if v_idx:
+                            vw.write_batch(pa.record_batch([
+                                batch.column("image").take(v_idx),
+                                batch.column("text").take(v_idx),
+                            ], schema=final_schema))
+                            n_val += len(v_idx)
+                # Delete chunk after successful merge to free disk space
+                cf.unlink()
+
+            except Exception as e:
+                print(f"\n[merge] WARNING: skipping corrupt chunk {cf.name}: {e}", flush=True)
+                corrupt.append(cf)
 
     print(f"[merge] done — train: {n_train:,}  val: {n_val:,}", flush=True)
-    return {"train": n_train, "val": n_val}
+
+    if corrupt:
+        print(f"\n[merge] {len(corrupt)} corrupt chunk(s) — page ranges that need re-processing:")
+        for cf in corrupt:
+            start_page = int(cf.stem)
+            end_page   = start_page + CHUNK_PAGES - 1
+            print(f"  {cf.name}  (pages {start_page:,} – {end_page:,})")
+        print(f"\n  To re-process: delete the corrupt chunk files, reset progress.json")
+        print(f"  to the first corrupt page, then re-run prepare.")
+        print(f"  Corrupt chunks are kept in {chunks_dir} for inspection.")
+
+    return {"train": n_train, "val": n_val, "corrupt_chunks": len(corrupt)}
 
 
 def prepare(limit: Optional[int], val_ratio: float):
@@ -512,6 +540,11 @@ def main():
     tr.add_argument("--resume",     type=str,   default=None)
 
     sub.add_parser("compile")
+
+    mg = sub.add_parser("merge",
+        help="Merge existing chunk files into train.arrow + val.arrow (standalone, no prepare needed)")
+    mg.add_argument("--val-ratio", type=float, default=0.1)
+
     sub.add_parser("save-gt")
     sub.add_parser("load-gt")
 
@@ -524,6 +557,9 @@ def main():
         prepare(args.limit, args.val_ratio)
     elif args.stage == "compile":
         compile_gt()
+    elif args.stage == "merge":
+        counts = _merge_chunks(GT_DIR / "chunks", GT_DIR, args.val_ratio)
+        (GT_DIR / "stats.json").write_text(json.dumps(counts, indent=2))
     elif args.stage == "save-gt":
         save_gt()
     elif args.stage == "load-gt":
