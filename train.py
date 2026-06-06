@@ -327,10 +327,25 @@ def _stream_catmus(
     return total_rows, total_lines, skipped
 
 
+MIN_FREE_GB = 5.0   # abort if less than this much disk space remains
+
+
+def _check_disk(path: Path) -> None:
+    """Abort with a clear message if free disk space drops below MIN_FREE_GB."""
+    import shutil
+    free_gb = shutil.disk_usage(path).free / 1e9
+    if free_gb < MIN_FREE_GB:
+        raise RuntimeError(
+            f"[prepare] DISK FULL — only {free_gb:.1f} GB free on {path.anchor}. "
+            f"Free at least {MIN_FREE_GB} GB and re-run (progress will resume)."
+        )
+
+
 def _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx):
     import pyarrow as pa
     if not b_imgs:
         return
+    _check_disk(Path(cw_state.get("dir", "/tmp")))
     cw_state["writer"].write_batch(pa.record_batch([
         pa.array(b_imgs, pa.binary()),
         pa.array(b_txts, pa.utf8()),
@@ -340,11 +355,42 @@ def _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx):
 
 
 def _rotate_chunk_inner(chunks_dir, chunk_schema, cw_state, b_imgs, b_txts, b_pidx, up_to):
+    """
+    Close the current chunk, validate it, save progress, open the next chunk.
+
+    pyarrow silently swallows IOError on close (missing footer = corrupt file).
+    We detect this by re-opening the file: if it fails, we do NOT save progress
+    so the corrupt page range will be re-processed on the next resume.
+    """
     import pyarrow as pa
     _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx)
-    cw_state["writer"].close()
-    _save_progress(up_to)
-    print(f"[prepare] chunk {cw_state['start']:07d}.arrow saved", flush=True)
+
+    chunk_path = chunks_dir / f"{cw_state['start']:07d}.arrow"
+    cw_state["writer"].close()   # may silently fail (IOError swallowed by pyarrow)
+
+    # --- validate chunk ---
+    try:
+        with pa.ipc.open_file(chunk_path):
+            pass
+        valid = True
+    except Exception as e:
+        valid = False
+        print(f"\n[prepare] ERROR: chunk {chunk_path.name} is CORRUPT ({e}). "
+              f"Progress NOT saved — this page range will be re-processed on resume.\n"
+              f"          Most likely cause: disk full. Free space and re-run.",
+              flush=True)
+
+    if valid:
+        _save_progress(up_to)
+        print(f"[prepare] chunk {chunk_path.name} saved "
+              f"(pages {cw_state['start']:,}–{up_to:,})", flush=True)
+    else:
+        chunk_path.unlink(missing_ok=True)   # remove corrupt file
+        raise RuntimeError(
+            f"Chunk {chunk_path.name} could not be finalised — disk may be full. "
+            f"Free space and re-run to resume from page {cw_state['start']:,}."
+        )
+
     nxt = up_to + 1
     cw_state.update({
         "start":  nxt,
@@ -382,6 +428,7 @@ def prepare(limit: Optional[int], val_ratio: float, include_catmus: bool = False
     cw_state = {
         "start":  start_idx,
         "count":  0,
+        "dir":    str(chunks_dir),   # for disk-space checks
         "writer": pa.ipc.new_file(chunks_dir / f"{start_idx:07d}.arrow", chunk_schema),
     }
     b_imgs: list[bytes] = []
