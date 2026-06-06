@@ -38,10 +38,12 @@ GT_REPO="${GT_REPO:-thodel/kraken-htr-data}"
 # ---------------------------------------------------------------------------
 SKIP_PREPARE=0
 SKIP_SAVE_GT=0
+INCLUDE_CATMUS=0
 for arg in "$@"; do
     case $arg in
-        --skip-prepare) SKIP_PREPARE=1 ;;
-        --skip-save-gt) SKIP_SAVE_GT=1 ;;
+        --skip-prepare)   SKIP_PREPARE=1 ;;
+        --skip-save-gt)   SKIP_SAVE_GT=1 ;;
+        --include-catmus) INCLUDE_CATMUS=1 ;;
     esac
 done
 
@@ -103,7 +105,9 @@ echo "  Log        : $LOGFILE"
 
 # Stage 1 — Prepare or load from Hub
 if [ "$SKIP_PREPARE" -eq 0 ]; then
-    run_stage prepare
+    CATMUS_FLAG=""
+    [ "$INCLUDE_CATMUS" -eq 1 ] && CATMUS_FLAG="--include-catmus"
+    run_stage prepare $CATMUS_FLAG
 else
     echo ""
     echo "[skip] prepare — restoring GT from Hub ($GT_REPO)"

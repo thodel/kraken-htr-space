@@ -31,7 +31,11 @@ from tqdm import tqdm
 # Constants
 # ---------------------------------------------------------------------------
 
-DATASET_ID = "dh-unibe/image-text_medieval-scripts_xiv-xv-xvi"
+DATASET_ID        = "dh-unibe/image-text_medieval-scripts_xiv-xv-xvi"
+CATMUS_ID         = "CATMuS/medieval"
+# CATMuS row indices are offset so they never collide with dh-unibe page indices
+# in the page_idx column used for train/val split.
+CATMUS_IDX_OFFSET = 10_000_000
 
 VGSL_SPEC = (
     "[256,64,0,1 "
@@ -160,9 +164,41 @@ def _line_crops_from_page(sample: dict) -> list[tuple[bytes, str]]:
 
 
 def _process_one(args: tuple) -> tuple[int, list[tuple[bytes, str]]]:
-    """Thread worker: returns (page_idx, [(jpeg_bytes, text), …])."""
+    """Thread worker for dh-unibe: returns (page_idx, [(jpeg_bytes, text), …])."""
     idx, sample = args
     return idx, _line_crops_from_page(sample)
+
+
+def _process_catmus(args: tuple) -> tuple[int, list[tuple[bytes, str]]]:
+    """
+    Thread worker for CATMuS/medieval.
+    Each row is already a line image (field 'im') + transcription (field 'text').
+    Filters to DefaultLine only; skips empty transcriptions.
+    """
+    idx, sample = args
+    text = (sample.get("text") or "").strip()
+    if not text:
+        return idx, []
+    # Only keep main text lines (exclude headers, rubrics, marginalia, etc.)
+    if sample.get("line_type", "DefaultLine") not in ("DefaultLine", ""):
+        return idx, []
+
+    img = sample.get("im")
+    if img is None:
+        return idx, []
+    try:
+        if isinstance(img, dict):
+            img = Image.open(io.BytesIO(img["bytes"])).convert("RGB")
+        elif isinstance(img, bytes):
+            img = Image.open(io.BytesIO(img)).convert("RGB")
+        else:
+            img = img.convert("RGB")
+    except Exception:
+        return idx, []
+
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=95)
+    return idx, [(buf.getvalue(), text)]
 
 
 def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
@@ -230,7 +266,94 @@ def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
     return {"train": n_train, "val": n_val, "corrupt_chunks": len(corrupt)}
 
 
-def prepare(limit: Optional[int], val_ratio: float):
+def _stream_catmus(
+    chunks_dir: Path,
+    chunk_schema,
+    cw_state: dict,
+    b_imgs: list, b_txts: list, b_pidx: list,
+    val_ratio: float,
+    pool,
+) -> tuple[int, int, int]:
+    """
+    Stream CATMuS/medieval (train split, ~152K lines) and append to the
+    current Arrow chunk writer.  Returns (total_rows, total_lines, skipped).
+    """
+    from datasets import load_dataset, disable_caching
+    import pyarrow as pa
+
+    disable_caching()
+    print(f"[prepare-catmus] Streaming {CATMUS_ID} …", flush=True)
+    ds = load_dataset(CATMUS_ID, split="train", streaming=True)
+
+    total_rows = total_lines = skipped = 0
+    PAGE_BATCH = 128
+
+    buf: list[tuple] = []
+
+    def flush_buf(max_i: int):
+        nonlocal total_rows, total_lines, skipped
+        from concurrent.futures import as_completed
+        futs = {pool.submit(_process_catmus, item): item[0] for item in buf}
+        for fut in as_completed(futs):
+            _, crops = fut.result()
+            total_rows += 1
+            cw_state["count"] += 1
+            if not crops:
+                skipped += 1
+            for img_b, txt in crops:
+                b_imgs.append(img_b); b_txts.append(txt)
+                b_pidx.append(futs[fut])   # use the offset idx as page_idx
+                total_lines += 1
+                if len(b_imgs) >= WRITE_LINES:
+                    _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx)
+        buf.clear()
+        if cw_state["count"] >= CHUNK_PAGES:
+            _rotate_chunk_inner(chunks_dir, chunk_schema, cw_state, b_imgs, b_txts, b_pidx, max_i)
+
+    pbar = tqdm(total=152_800, desc="prepare-catmus (lines)", file=sys.stdout)
+    for row_idx, sample in enumerate(ds):
+        # Offset index into the CATMuS namespace
+        offset_idx = CATMUS_IDX_OFFSET + row_idx
+        buf.append((offset_idx, sample))
+        pbar.update(1)
+        if len(buf) >= PAGE_BATCH:
+            flush_buf(offset_idx)
+    if buf:
+        flush_buf(CATMUS_IDX_OFFSET + row_idx)
+    pbar.close()
+
+    print(f"[prepare-catmus] done — rows: {total_rows:,}  lines: {total_lines:,}  "
+          f"skipped: {skipped:,}", flush=True)
+    return total_rows, total_lines, skipped
+
+
+def _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx):
+    import pyarrow as pa
+    if not b_imgs:
+        return
+    cw_state["writer"].write_batch(pa.record_batch([
+        pa.array(b_imgs, pa.binary()),
+        pa.array(b_txts, pa.utf8()),
+        pa.array(b_pidx, pa.int32()),
+    ], schema=chunk_schema))
+    b_imgs.clear(); b_txts.clear(); b_pidx.clear()
+
+
+def _rotate_chunk_inner(chunks_dir, chunk_schema, cw_state, b_imgs, b_txts, b_pidx, up_to):
+    import pyarrow as pa
+    _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx)
+    cw_state["writer"].close()
+    _save_progress(up_to)
+    print(f"[prepare] chunk {cw_state['start']:07d}.arrow saved", flush=True)
+    nxt = up_to + 1
+    cw_state.update({
+        "start":  nxt,
+        "count":  0,
+        "writer": pa.ipc.new_file(chunks_dir / f"{nxt:07d}.arrow", chunk_schema),
+    })
+
+
+def prepare(limit: Optional[int], val_ratio: float, include_catmus: bool = False):
     import pyarrow as pa
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from datasets import load_dataset, disable_caching
@@ -255,13 +378,12 @@ def prepare(limit: Optional[int], val_ratio: float):
     if start_idx > 0:
         ds = ds.skip(start_idx)
 
-    # Mutable chunk-writer state (wrapped in list to allow reassignment in closures)
+    # Shared mutable state passed into helpers
     cw_state = {
         "start":  start_idx,
         "count":  0,
         "writer": pa.ipc.new_file(chunks_dir / f"{start_idx:07d}.arrow", chunk_schema),
     }
-    # Line batch buffers
     b_imgs: list[bytes] = []
     b_txts: list[str]   = []
     b_pidx: list[int]   = []
@@ -270,31 +392,14 @@ def prepare(limit: Optional[int], val_ratio: float):
     offset = -1
 
     def _flush_lines():
-        if not b_imgs:
-            return
-        cw_state["writer"].write_batch(pa.record_batch([
-            pa.array(b_imgs, pa.binary()),
-            pa.array(b_txts, pa.utf8()),
-            pa.array(b_pidx, pa.int32()),
-        ], schema=chunk_schema))
-        b_imgs.clear(); b_txts.clear(); b_pidx.clear()
+        _flush_lines_inner(cw_state, chunk_schema, b_imgs, b_txts, b_pidx)
 
     def _rotate_chunk(up_to_page: int):
-        _flush_lines()
-        cw_state["writer"].close()
-        _save_progress(up_to_page)
-        print(f"[prepare] chunk {cw_state['start']:07d}.arrow saved "
-              f"(pages {cw_state['start']:,}–{up_to_page:,})", flush=True)
-        nxt = up_to_page + 1
-        cw_state.update({
-            "start":  nxt,
-            "count":  0,
-            "writer": pa.ipc.new_file(chunks_dir / f"{nxt:07d}.arrow", chunk_schema),
-        })
+        _rotate_chunk_inner(chunks_dir, chunk_schema, cw_state, b_imgs, b_txts, b_pidx, up_to_page)
 
     with ThreadPoolExecutor(max_workers=N_WORKERS) as pool:
         pbar = tqdm(total=max(0, (limit or 497_400) - start_idx),
-                    desc="prepare (pages)", file=sys.stdout)
+                    desc="prepare dh-unibe (pages)", file=sys.stdout)
         buf: list[tuple] = []
         max_i = start_idx
 
@@ -321,7 +426,6 @@ def prepare(limit: Optional[int], val_ratio: float):
             i = start_idx + offset
             if limit and i >= limit:
                 break
-            # Resume check: skip pages already in a completed chunk
             chunk_file = chunks_dir / f"{(i // CHUNK_PAGES) * CHUNK_PAGES:07d}.arrow"
             if chunk_file.exists() and i < last_done:
                 pbar.update(1)
@@ -336,7 +440,17 @@ def prepare(limit: Optional[int], val_ratio: float):
             flush_buf()
         pbar.close()
 
-    # Close final (possibly partial) chunk
+        # --- Optional: append CATMuS/medieval ---
+        if include_catmus:
+            c_rows, c_lines, c_skip = _stream_catmus(
+                chunks_dir, chunk_schema, cw_state,
+                b_imgs, b_txts, b_pidx, val_ratio, pool,
+            )
+            total_lines += c_lines
+            skipped     += c_skip
+            print(f"[prepare] CATMuS added {c_lines:,} lines from {c_rows:,} rows", flush=True)
+
+    # Close final chunk
     _flush_lines()
     cw_state["writer"].close()
     final_idx = start_idx + offset if offset >= 0 else last_done
@@ -529,8 +643,10 @@ def main():
     sub = p.add_subparsers(dest="stage", required=True)
 
     pr = sub.add_parser("prepare")
-    pr.add_argument("--limit",     type=int,   default=None)
-    pr.add_argument("--val-ratio", type=float, default=0.1)
+    pr.add_argument("--limit",           type=int,   default=None)
+    pr.add_argument("--val-ratio",       type=float, default=0.1)
+    pr.add_argument("--include-catmus",  action="store_true", default=False,
+                    help="Append CATMuS/medieval (~152K lines) after dh-unibe")
 
     tr = sub.add_parser("train")
     tr.add_argument("--epochs",     type=int,   default=50)
@@ -554,7 +670,7 @@ def main():
     args = p.parse_args()
 
     if args.stage == "prepare":
-        prepare(args.limit, args.val_ratio)
+        prepare(args.limit, args.val_ratio, args.include_catmus)
     elif args.stage == "compile":
         compile_gt()
     elif args.stage == "merge":
