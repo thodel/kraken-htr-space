@@ -560,17 +560,22 @@ def train(
     if not train_arrow.exists():
         sys.exit("[train] ERROR: train.arrow not found — run compile first")
 
+    # ketos -e expects a text manifest (one path per line), not a binary file directly.
+    # Write a one-line manifest pointing to val.arrow.
+    val_manifest = MODELS_DIR / "val_manifest.txt"
+    val_manifest.write_text(str(val_arrow) + "\n")
+
     # Build device string: "cuda:0" for 1 GPU, "cuda:0,cuda:1" for 2, etc.
     device_str = ",".join(f"cuda:{i}" for i in range(num_gpus))
 
     cmd = [
         "ketos",
         "-d", device_str,
-        "--workers", str(min(8, num_gpus * 4)),  # data loader workers
+        "--workers", str(min(8, num_gpus * 4)),
         "train",
         "-f", "binary",
         "-s", VGSL_SPEC,
-        "-e", str(val_arrow),
+        "-e", str(val_manifest),
         "-o", str(MODELS_DIR / "kraken_plus"),
         "-N", str(epochs),
         "-B", str(batch_size),
