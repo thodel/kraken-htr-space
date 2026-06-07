@@ -592,7 +592,8 @@ def train(
 # Save / load ground truth to/from HF Hub
 # ---------------------------------------------------------------------------
 
-GT_REPO_DEFAULT = "thodel/kraken-htr-data"   # private dataset repo for GT storage
+GT_REPO_DEFAULT    = "thodel/kraken-htr-data"    # private dataset repo for raw GT chunks
+ARROW_REPO_DEFAULT = "thodel/kraken-htr-arrow"  # public dataset repo for final Arrow files
 
 
 def save_gt():
@@ -660,6 +661,133 @@ def load_gt():
 
 
 # ---------------------------------------------------------------------------
+# Upload / download final Arrow files
+# ---------------------------------------------------------------------------
+
+def upload_arrow():
+    """
+    Upload train.arrow + val.arrow + stats.json to a dedicated HF dataset repo.
+
+    These files are the output of the full prepare pipeline and can be used
+    directly for ketos training without any preprocessing.  Uploading them
+    once saves ~10 h of preprocessing on every future training run.
+
+    Target repo  : ARROW_REPO env var (default: thodel/kraken-htr-arrow)
+    Visibility   : public by default (change with --private via env ARROW_PRIVATE=1)
+    """
+    from huggingface_hub import HfApi
+    token       = os.environ.get("HF_TOKEN")
+    arrow_repo  = os.environ.get("ARROW_REPO", ARROW_REPO_DEFAULT)
+    private     = os.environ.get("ARROW_PRIVATE", "0") == "1"
+
+    files = {
+        "train.arrow": GT_DIR / "train.arrow",
+        "val.arrow":   GT_DIR / "val.arrow",
+        "stats.json":  GT_DIR / "stats.json",
+    }
+    for name, path in files.items():
+        if not path.exists():
+            sys.exit(f"[upload-arrow] ERROR: {path} not found — run prepare first")
+
+    api = HfApi()
+    api.create_repo(arrow_repo, repo_type="dataset",
+                    exist_ok=True, private=private, token=token)
+
+    # Write a minimal dataset card
+    card = f"""---
+license: cc-by-4.0
+task_categories:
+- image-to-text
+tags:
+- htr
+- handwritten-text-recognition
+- medieval
+- kraken
+pretty_name: Kraken+ Medieval HTR — Arrow binary ground truth
+---
+
+# Kraken+ Medieval HTR — Arrow Ground Truth
+
+Pre-processed line-image ground truth for training the **kraken+** HTR model
+on medieval manuscripts.
+
+## Sources
+- [dh-unibe/image-text_medieval-scripts_xiv-xv-xvi](https://huggingface.co/datasets/dh-unibe/image-text_medieval-scripts_xiv-xv-xvi) (MIT)
+- [CATMuS/medieval](https://huggingface.co/datasets/CATMuS/medieval) (CC-BY 4.0, if included)
+
+## Contents
+| File | Description |
+|---|---|
+| `train.arrow` | Training set (Arrow IPC, `image` + `text` columns) |
+| `val.arrow` | Validation set |
+| `stats.json` | Row counts and source metadata |
+
+## Usage
+```bash
+# Download
+hf download {arrow_repo} train.arrow val.arrow --local-dir .
+
+# Train directly
+ketos -d cuda:0,cuda:1 train -f binary -s "[256,64,0,1 ...]" train.arrow
+```
+"""
+    api.upload_file(
+        path_or_fileobj=card.encode(),
+        path_in_repo="README.md",
+        repo_id=arrow_repo,
+        repo_type="dataset",
+        token=token,
+        commit_message="update dataset card",
+    )
+
+    for name, path in files.items():
+        size_gb = path.stat().st_size / 1e9
+        print(f"[upload-arrow] {name}  ({size_gb:.1f} GB) → {arrow_repo}", flush=True)
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=name,
+            repo_id=arrow_repo,
+            repo_type="dataset",
+            token=token,
+            commit_message=f"upload {name}",
+        )
+
+    url = f"https://huggingface.co/datasets/{arrow_repo}"
+    print(f"[upload-arrow] done → {url}", flush=True)
+
+
+def download_arrow():
+    """
+    Download train.arrow + val.arrow from the Arrow repo directly into GT_DIR.
+    This replaces the full prepare pipeline (~10 h) with a ~5 min download.
+    """
+    from huggingface_hub import hf_hub_download
+    token      = os.environ.get("HF_TOKEN")
+    arrow_repo = os.environ.get("ARROW_REPO", ARROW_REPO_DEFAULT)
+
+    GT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[download-arrow] Downloading from {arrow_repo} …", flush=True)
+
+    for name in ("train.arrow", "val.arrow", "stats.json"):
+        dest = GT_DIR / name
+        if dest.exists():
+            print(f"[download-arrow] {name} already exists — skipping", flush=True)
+            continue
+        print(f"[download-arrow] {name} …", flush=True)
+        hf_hub_download(
+            repo_id=arrow_repo,
+            filename=name,
+            repo_type="dataset",
+            local_dir=str(GT_DIR),
+            token=token,
+        )
+        size_gb = dest.stat().st_size / 1e9
+        print(f"[download-arrow] {name}  ({size_gb:.1f} GB) ✓", flush=True)
+
+    print(f"[download-arrow] done — ready to train", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint upload
 # ---------------------------------------------------------------------------
 
@@ -710,6 +838,10 @@ def main():
 
     sub.add_parser("save-gt")
     sub.add_parser("load-gt")
+    sub.add_parser("upload-arrow",
+        help="Upload train.arrow + val.arrow to HF Hub (ARROW_REPO env var)")
+    sub.add_parser("download-arrow",
+        help="Download train.arrow + val.arrow from HF Hub — skips prepare entirely")
 
     pu = sub.add_parser("push")
     pu.add_argument("--output-repo", type=str, required=True)
@@ -727,6 +859,10 @@ def main():
         save_gt()
     elif args.stage == "load-gt":
         load_gt()
+    elif args.stage == "upload-arrow":
+        upload_arrow()
+    elif args.stage == "download-arrow":
+        download_arrow()
     elif args.stage == "train":
         train(args.epochs, args.batch_size, args.lr, args.num_gpus, args.resume)
     elif args.stage == "push":

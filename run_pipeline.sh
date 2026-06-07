@@ -39,11 +39,15 @@ GT_REPO="${GT_REPO:-thodel/kraken-htr-data}"
 SKIP_PREPARE=0
 SKIP_SAVE_GT=0
 INCLUDE_CATMUS=0
+FROM_ARROW=0       # --from-arrow: download Arrow files and skip prepare entirely
+UPLOAD_ARROW=0     # --upload-arrow: upload final Arrow files to Hub after prepare
 for arg in "$@"; do
     case $arg in
         --skip-prepare)   SKIP_PREPARE=1 ;;
         --skip-save-gt)   SKIP_SAVE_GT=1 ;;
         --include-catmus) INCLUDE_CATMUS=1 ;;
+        --from-arrow)     FROM_ARROW=1; SKIP_PREPARE=1; SKIP_SAVE_GT=1 ;;
+        --upload-arrow)   UPLOAD_ARROW=1 ;;
     esac
 done
 
@@ -103,24 +107,33 @@ echo "  Log        : $LOGFILE"
 # Pipeline
 # ---------------------------------------------------------------------------
 
-# Stage 1 — Prepare or load from Hub
-if [ "$SKIP_PREPARE" -eq 0 ]; then
+# Stage 1 — Prepare / load GT / download Arrow
+if [ "$FROM_ARROW" -eq 1 ]; then
+    echo ""
+    echo "[fast] Downloading Arrow files from Hub — skipping prepare entirely"
+    run_stage download-arrow
+elif [ "$SKIP_PREPARE" -eq 0 ]; then
     CATMUS_FLAG=""
     [ "$INCLUDE_CATMUS" -eq 1 ] && CATMUS_FLAG="--include-catmus"
     run_stage prepare $CATMUS_FLAG
 else
     echo ""
-    echo "[skip] prepare — restoring GT from Hub ($GT_REPO)"
+    echo "[skip] prepare — restoring GT chunks from Hub ($GT_REPO)"
     run_stage load-gt
-    SKIP_SAVE_GT=1   # no need to re-save what we just loaded
+    SKIP_SAVE_GT=1
 fi
 
-# Stage 2 — Persist GT to Hub
-if [ "$SKIP_SAVE_GT" -eq 0 ]; then
+# Stage 2 — Persist raw GT chunks to Hub (skip if we came from Arrow)
+if [ "$SKIP_SAVE_GT" -eq 0 ] && [ "$FROM_ARROW" -eq 0 ]; then
     run_stage save-gt
 fi
 
-# Stage 3 — Compile to Arrow binary
+# Stage 3 — Upload final Arrow files to Hub (optional)
+if [ "$UPLOAD_ARROW" -eq 1 ] && [ "$FROM_ARROW" -eq 0 ]; then
+    run_stage upload-arrow
+fi
+
+# Stage 4 — Compile (no-op if Arrow already present)
 run_stage compile
 
 # Stage 4 — Train on 2× A40
