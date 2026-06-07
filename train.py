@@ -203,67 +203,128 @@ def _process_catmus(args: tuple) -> tuple[int, list[tuple[bytes, str]]]:
 
 def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
     """
-    Merge all chunk Arrow files into train.arrow + val.arrow.
+    Merge chunk Arrow files into train.arrow + val.arrow in kraken's binary format.
 
-    Robustness:
-    - Each chunk is deleted after successful merge → peak disk = chunks + output,
-      not chunks + output simultaneously (cuts disk need roughly in half).
-    - Corrupt / incomplete chunks (missing Arrow footer) are skipped with a
-      warning; their page ranges are printed so prepare can re-process them.
+    Kraken's ArrowIPCRecognitionDataset requires:
+    - Single 'lines' column of struct type {im: binary, text: string}
+    - Schema metadata key b'lines' with JSON: {type, counts, alphabet, legacy_polygons, image_type}
+
+    Two-pass approach:
+    Pass 1 — scan chunks to build alphabet + count train/val samples (needed for metadata)
+    Pass 2 — write final Arrow files (delete each chunk after success to save disk)
     """
     import pyarrow as pa
-    _, final_schema = _arrow_schemas()
+    import json
+    from collections import Counter
 
     val_step    = round(1 / val_ratio)
     chunk_files = sorted(chunks_dir.glob("*.arrow"))
-    print(f"[merge] {len(chunk_files)} chunk files → train.arrow + val.arrow", flush=True)
+    print(f"[merge] {len(chunk_files)} chunk files  val_step={val_step}", flush=True)
 
+    # ---- Pass 1: build alphabet + count lines --------------------------------
+    print("[merge] Pass 1/2 — building alphabet and counting lines …", flush=True)
+    alphabet: Counter = Counter()
     n_train = n_val = 0
+    corrupt_p1: set[str] = set()
+
+    for cf in tqdm(chunk_files, desc="pass 1", file=sys.stdout):
+        try:
+            with pa.ipc.open_file(cf) as reader:
+                for bi in range(reader.num_record_batches):
+                    batch = reader.get_batch(bi)
+                    for page, txt in zip(
+                        batch.column("page_idx").to_pylist(),
+                        batch.column("text").to_pylist(),
+                    ):
+                        if txt:
+                            alphabet.update(txt)
+                        if page % val_step == 0:
+                            n_val += 1
+                        else:
+                            n_train += 1
+        except Exception as e:
+            print(f"\n[merge] WARNING pass 1: corrupt chunk {cf.name}: {e}", flush=True)
+            corrupt_p1.add(cf.name)
+
+    print(f"[merge] alphabet: {len(alphabet):,} chars  "
+          f"train: {n_train:,}  val: {n_val:,}", flush=True)
+
+    # ---- Build kraken-compatible schemas ------------------------------------
+    struct_type = pa.struct([
+        pa.field("im",   pa.binary()),
+        pa.field("text", pa.string()),
+    ])
+
+    def _make_schema(n_all: int) -> pa.Schema:
+        meta = {
+            "type":            "kraken_recognition_bbox",
+            "counts":          {"all": n_all, "train": n_all, "validation": 0, "test": 0},
+            "alphabet":        dict(alphabet),
+            "legacy_polygons": False,
+            "image_type":      "raw",
+        }
+        return pa.schema(
+            [pa.field("lines", struct_type)],
+            metadata={"lines": json.dumps(meta)},
+        )
+
+    train_schema = _make_schema(n_train)
+    val_schema   = _make_schema(n_val)
+
+    # ---- Pass 2: write final Arrow files ------------------------------------
+    print("[merge] Pass 2/2 — writing train.arrow + val.arrow …", flush=True)
     corrupt: list[Path] = []
+    n_train_w = n_val_w = 0
 
-    with pa.ipc.new_file(gt_dir / "train.arrow", final_schema) as tw, \
-         pa.ipc.new_file(gt_dir / "val.arrow",   final_schema) as vw:
+    with pa.ipc.new_file(gt_dir / "train.arrow", train_schema) as tw, \
+         pa.ipc.new_file(gt_dir / "val.arrow",   val_schema)   as vw:
 
-        for cf in tqdm(chunk_files, desc="merge chunks", file=sys.stdout):
+        for cf in tqdm(chunk_files, desc="pass 2", file=sys.stdout):
             try:
                 with pa.ipc.open_file(cf) as reader:
                     for bi in range(reader.num_record_batches):
-                        batch     = reader.get_batch(bi)
-                        page_idxs = batch.column("page_idx").to_pylist()
-                        t_idx = [i for i, p in enumerate(page_idxs) if p % val_step != 0]
-                        v_idx = [i for i, p in enumerate(page_idxs) if p % val_step == 0]
-                        if t_idx:
-                            tw.write_batch(pa.record_batch([
-                                batch.column("image").take(t_idx),
-                                batch.column("text").take(t_idx),
-                            ], schema=final_schema))
-                            n_train += len(t_idx)
-                        if v_idx:
-                            vw.write_batch(pa.record_batch([
-                                batch.column("image").take(v_idx),
-                                batch.column("text").take(v_idx),
-                            ], schema=final_schema))
-                            n_val += len(v_idx)
-                # Delete chunk after successful merge to free disk space
-                cf.unlink()
+                        batch  = reader.get_batch(bi)
+                        pages  = batch.column("page_idx").to_pylist()
+                        imgs   = batch.column("image").to_pylist()
+                        txts   = batch.column("text").to_pylist()
+
+                        t_structs = [{"im": img, "text": txt}
+                                     for p, img, txt in zip(pages, imgs, txts)
+                                     if p % val_step != 0]
+                        v_structs = [{"im": img, "text": txt}
+                                     for p, img, txt in zip(pages, imgs, txts)
+                                     if p % val_step == 0]
+
+                        if t_structs:
+                            tw.write_batch(pa.record_batch(
+                                [pa.array(t_structs, type=struct_type)],
+                                schema=train_schema,
+                            ))
+                            n_train_w += len(t_structs)
+                        if v_structs:
+                            vw.write_batch(pa.record_batch(
+                                [pa.array(v_structs, type=struct_type)],
+                                schema=val_schema,
+                            ))
+                            n_val_w += len(v_structs)
+
+                cf.unlink()   # free disk space immediately
 
             except Exception as e:
                 print(f"\n[merge] WARNING: skipping corrupt chunk {cf.name}: {e}", flush=True)
                 corrupt.append(cf)
 
-    print(f"[merge] done — train: {n_train:,}  val: {n_val:,}", flush=True)
+    print(f"[merge] done — train: {n_train_w:,}  val: {n_val_w:,}", flush=True)
 
     if corrupt:
-        print(f"\n[merge] {len(corrupt)} corrupt chunk(s) — page ranges that need re-processing:")
+        print(f"\n[merge] {len(corrupt)} corrupt chunk(s) — page ranges to re-process:")
         for cf in corrupt:
-            start_page = int(cf.stem)
-            end_page   = start_page + CHUNK_PAGES - 1
-            print(f"  {cf.name}  (pages {start_page:,} – {end_page:,})")
-        print(f"\n  To re-process: delete the corrupt chunk files, reset progress.json")
-        print(f"  to the first corrupt page, then re-run prepare.")
-        print(f"  Corrupt chunks are kept in {chunks_dir} for inspection.")
+            start = int(cf.stem)
+            print(f"  {cf.name}  (pages {start:,} – {start + CHUNK_PAGES - 1:,})")
+        print(f"\n  Reset progress.json to first corrupt page and re-run prepare.",
+              flush=True)
 
-    return {"train": n_train, "val": n_val, "corrupt_chunks": len(corrupt)}
+    return {"train": n_train_w, "val": n_val_w, "corrupt_chunks": len(corrupt)}
 
 
 def _stream_catmus(
