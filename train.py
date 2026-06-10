@@ -250,26 +250,45 @@ def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
           f"train: {n_train:,}  val: {n_val:,}", flush=True)
 
     # ---- Build kraken-compatible schemas ------------------------------------
+    # Kraken's ArrowIPCRecognitionDataset requires:
+    #   lines: struct<text: string, im: binary>
+    #   train: bool
+    #   validation: bool
+    #   test: bool
+    # It filters rows by the boolean columns to build train_set / val_set.
     struct_type = pa.struct([
-        pa.field("im",   pa.binary()),
         pa.field("text", pa.string()),
+        pa.field("im",   pa.binary()),
     ])
 
-    def _make_schema(n_all: int) -> pa.Schema:
+    def _make_schema(n_all: int, split: str) -> pa.Schema:
         meta = {
             "type":            "kraken_recognition_bbox",
-            "counts":          {"all": n_all, "train": n_all, "validation": 0, "test": 0},
+            "counts":          {
+                "all":        n_all,
+                "train":      n_all if split == "train" else 0,
+                "validation": n_all if split == "validation" else 0,
+                "test":       0,
+            },
             "alphabet":        dict(alphabet),
             "legacy_polygons": False,
             "image_type":      "raw",
+            "text_type":       "raw",
+            "splits":          ["train", "eval", "test"],
+            "im_mode":         "RGB",
         }
         return pa.schema(
-            [pa.field("lines", struct_type)],
+            [
+                pa.field("lines",      struct_type),
+                pa.field("train",      pa.bool_()),
+                pa.field("validation", pa.bool_()),
+                pa.field("test",       pa.bool_()),
+            ],
             metadata={"lines": json.dumps(meta)},
         )
 
-    train_schema = _make_schema(n_train)
-    val_schema   = _make_schema(n_val)
+    train_schema = _make_schema(n_train, "train")
+    val_schema   = _make_schema(n_val,   "validation")
 
     # ---- Pass 2: write final Arrow files ------------------------------------
     print("[merge] Pass 2/2 — writing train.arrow + val.arrow …", flush=True)
@@ -288,25 +307,33 @@ def _merge_chunks(chunks_dir: Path, gt_dir: Path, val_ratio: float) -> dict:
                         imgs   = batch.column("image").to_pylist()
                         txts   = batch.column("text").to_pylist()
 
-                        t_structs = [{"im": img, "text": txt}
+                        t_structs = [{"text": txt, "im": img}
                                      for p, img, txt in zip(pages, imgs, txts)
                                      if p % val_step != 0]
-                        v_structs = [{"im": img, "text": txt}
+                        v_structs = [{"text": txt, "im": img}
                                      for p, img, txt in zip(pages, imgs, txts)
                                      if p % val_step == 0]
 
                         if t_structs:
+                            n = len(t_structs)
                             tw.write_batch(pa.record_batch(
-                                [pa.array(t_structs, type=struct_type)],
+                                [pa.array(t_structs, type=struct_type),
+                                 pa.array([True]  * n, pa.bool_()),
+                                 pa.array([False] * n, pa.bool_()),
+                                 pa.array([False] * n, pa.bool_())],
                                 schema=train_schema,
                             ))
-                            n_train_w += len(t_structs)
+                            n_train_w += n
                         if v_structs:
+                            n = len(v_structs)
                             vw.write_batch(pa.record_batch(
-                                [pa.array(v_structs, type=struct_type)],
+                                [pa.array(v_structs, type=struct_type),
+                                 pa.array([False] * n, pa.bool_()),
+                                 pa.array([True]  * n, pa.bool_()),
+                                 pa.array([False] * n, pa.bool_())],
                                 schema=val_schema,
                             ))
-                            n_val_w += len(v_structs)
+                            n_val_w += n
 
                 cf.unlink()   # free disk space immediately
 
@@ -621,12 +648,6 @@ def train(
     if not train_arrow.exists():
         sys.exit("[train] ERROR: train.arrow not found — run compile first")
 
-    # ketos -e expects a text manifest (one path per line), not a binary file directly.
-    # Write a one-line manifest pointing to val.arrow.
-    val_manifest = MODELS_DIR / "val_manifest.txt"
-    val_manifest.write_text(str(val_arrow) + "\n")
-
-    # Build device string: "cuda:0" for 1 GPU, "cuda:0,cuda:1" for 2, etc.
     device_str = ",".join(f"cuda:{i}" for i in range(num_gpus))
 
     cmd = [
@@ -636,7 +657,7 @@ def train(
         "train",
         "-f", "binary",
         "-s", VGSL_SPEC,
-        "-e", str(val_manifest),
+        "-e", str(val_arrow),
         "-o", str(MODELS_DIR / "kraken_plus"),
         "-N", str(epochs),
         "-B", str(batch_size),
